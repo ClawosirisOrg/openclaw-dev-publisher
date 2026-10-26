@@ -1,7 +1,8 @@
 # Signed dev-agent publication: policy prototype
 
-This is a small, **inert** Gateway-side design prototype, not a publisher,
-installable OpenClaw plugin, or production deployment. It contains an
+This is a small, **inert** Gateway-side design prototype, not a publisher or
+production deployment. It now includes a manual OpenClaw package entry for a
+version-2 optional tool that always rejects publication. It contains an
 invocation-scoped signer-readiness gate and a publication function that always
 throws. It neither signs commits nor acquires credentials nor writes to GitHub.
 Node.js 20+ is required to run the tests.
@@ -111,10 +112,15 @@ artifact. None of those controls is implemented here.
 - Failures of adapters reject the call; avoid exposing sensitive adapter
   errors in API responses. Revocation, rotation, concurrency, race-free
   container identity binding and replay protection need a separate review.
-- OpenClaw **packer v2** packaging and plugin lifecycle are unsupported and
-  unverified. There is no plugin manifest or registration, compatibility
-  promise, installation command, active Gateway hook, or publisher service.
-  Do not deploy this tree as an activated plugin or infer v2 compatibility.
+- A manual `openclaw.plugin.json` and `src/plugin.mjs` now register an inert
+  optional version-2 tool. Its invocation guard is unit-tested, but installed
+  Gateway behavior is **not** verified. The authoring-only `openclaw plugins
+  validate/pack` commands reject manual entries without `defineToolPlugin`
+  metadata; switching to that helper would lose the version-2 guard. Installed
+  OpenClaw documentation separately supports reviewed package installs via
+  `npm pack` and `plugins install npm-pack:<archive>`. This package path has
+  not been activated or proven in an isolated Gateway. Do not treat a local
+  npm tarball as authorization to enable publication.
 - Treat the local tests as policy-unit tests using fakes, not an end-to-end
   security proof. Review the real adapter, signer, authorization and transport
   together before any deployment; keep keys and credentials outside this tree.

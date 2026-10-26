@@ -5,6 +5,12 @@
   "description": "Inert Gateway-side signed dev-agent publication pattern prototype",
   "type": "module",
   "license": "MIT",
+  "openclaw": {
+    "extensions": ["./src/plugin.mjs"],
+    "compat": { "pluginApi": ">=2026.10.3" },
+    "install": { "minHostVersion": ">=2026.10.3" }
+  },
+  "files": ["src/", "openclaw.plugin.json", "README.md", "LICENSE"],
   "scripts": { "test": "node --test" },
   "engines": { "node": ">=20" }
 }

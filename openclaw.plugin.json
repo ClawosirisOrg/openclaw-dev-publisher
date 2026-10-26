@@ -1,0 +1,26 @@
+{
+  "id": "openclaw-dev-publisher",
+  "name": "Signed dev-agent publisher (inactive)",
+  "description": "Inert versioned admission interface; no publication capability",
+  "categories": [
+    "developer-tools"
+  ],
+  "activation": {
+    "onStartup": false
+  },
+  "contracts": {
+    "tools": [
+      "request_signed_publication"
+    ]
+  },
+  "toolMetadata": {
+    "request_signed_publication": {
+      "optional": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
