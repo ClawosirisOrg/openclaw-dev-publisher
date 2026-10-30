@@ -1,11 +1,13 @@
 # Signed dev-agent publication: policy prototype
 
-This is a small, **inert** Gateway-side design prototype, not a publisher or
-production deployment. It now includes a manual OpenClaw package entry for a
-version-2 optional tool that always rejects publication. It contains an
-invocation-scoped signer-readiness gate and a publication function that always
-throws. It neither signs commits nor acquires credentials nor writes to GitHub.
-Node.js 20+ is required to run the tests.
+This is a **disabled** Gateway-side broker source repository, not an installed
+publisher or production deployment. The version-2 optional tool is scoped to a
+sandboxed development agent and always rejects publication. Its independent
+source modules cover admission, a one-use claim frame, read-base issuance,
+credential-free object verification, a dormant write-grant model, and one-shot
+Git transport fixtures. They are **not composed into a live write path**.
+No included entrypoint mints a write token or pushes to GitHub. Node.js 20+
+and Python 3 are needed for the complete offline test suite.
 
 ## Trust boundaries and threat model
 
@@ -96,7 +98,8 @@ or persistent Git credential helper. Separate SSH commit signing from Git
 transport and API authorization. Verify signed commit content and provenance
 before publication, require exact allowlist and owner authorization, reject
 replay, check remote state before write, and inspect the resulting remote
-artifact. None of those controls is implemented here.
+artifact. Individual offline modules test parts of those controls; no composed
+or deployed publisher implements them end-to-end.
 
 ## Limitations and deployment notes
 
@@ -125,4 +128,25 @@ artifact. None of those controls is implemented here.
   security proof. Review the real adapter, signer, authorization and transport
   together before any deployment; keep keys and credentials outside this tree.
 
-Run `npm test` to check the fake-IO policy tests. License: MIT.
+## Source and packaging status
+
+The public repository contains broker source under `src/`, `broker/issuer/`,
+`broker/worker/`, and `broker/transport/`; a no-default, disabled worker image
+recipe is under `containers/`. Offline tests are under `test/` and
+`broker/tests/`. Run `npm run test:all` to check both Node and Python fixtures.
+The current npm package allowlist includes only `src/` and plugin metadata;
+putting source in Git is not an installed worker or a deployment. Keys, tokens,
+actual App IDs, signer pins, image locks, and host paths belong only in a
+separately reviewed private deployment configuration, never this repository.
+
+Before any publication is enabled, complete and independently review the
+Gateway-to-UID1 private claim delivery, protected stage ownership and replay
+quarantine, separate object re-verification, final guarded write admission,
+isolated scoped-token transport, immutable image identity, mount/FD/`/proc`
+and egress probes, and remote readback with uncertain-outcome handling.
+A valid offline receipt is not a permit to mint a token. The `main` preflight
+is bounded but cannot atomically prevent stale branch creation. Plugin
+installation/allowlisting and the first live branch probe require separate
+owner review and authorization.
+
+License: MIT.

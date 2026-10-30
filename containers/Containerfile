@@ -1,0 +1,16 @@
+# Inert code-only prototype. BASE_IMAGE must be supplied by the operator as an
+# approved, locally available image reference ending in @sha256:<64 hex digits>.
+# There is deliberately no default tag or baked-in deployment identity.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# An isolated build context must contain only these reviewed source files and
+# this Containerfile. Do not COPY a whole directory, checkout, keys or config.
+COPY --chmod=0444 broker/worker/__init__.py broker/worker/claim.py broker/worker/capture_once.py broker/worker/handoff.py broker/worker/verifier.py /opt/publisher/broker/worker/
+COPY --chmod=0444 broker/transport/git_adapter.py broker/transport/one_shot.py /opt/publisher/broker/transport/
+COPY --chmod=0555 broker/transport/askpass.py /opt/publisher/broker/transport/askpass.py
+
+# This image is not an activated worker or a publisher. A later, separately
+# reviewed deployment must prove runtime UID, mounts, /proc and network policy.
+USER 1:1
+ENTRYPOINT ["/usr/bin/false"]

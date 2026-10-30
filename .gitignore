@@ -6,3 +6,17 @@ coverage/
 *.key
 *.sock
 *.log
+# Runtime-only broker authority and generated artifacts.
+__pycache__/
+*.py[cod]
+*.tgz
+*.pub
+image.lock
+*.token
+*.jwt
+*.p12
+*.pfx
+*.crt
+*.credentials
+private-config/
+protected-handoff/
