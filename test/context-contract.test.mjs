@@ -64,6 +64,15 @@ for (const [label, invalid] of [
   });
 }
 
+test('admission retains the original invocation assertion after context replacement', () => {
+  let current = true;
+  const host = context({ assertInvocationCurrent() { return current; } });
+  const admitted = admitCandidate(host, request);
+  current = false;
+  host.assertInvocationCurrent = () => true;
+  assert.throws(admitted.assertCurrent, /stale_invocation/);
+});
+
 test('expiration after admission and revoked sandbox invalidate the closure', () => {
   let current = true;
   const host = context({ assertInvocationCurrent() { return current; } });

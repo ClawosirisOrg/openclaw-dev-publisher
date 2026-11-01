@@ -24,7 +24,10 @@ export function admitCandidate(context, request) {
       typeof thinking !== 'string' || !THINKING.has(thinking)) {
     throw new Error('candidate_request_invalid');
   }
-  if (context.assertInvocationCurrent() === false) throw new Error('stale_invocation');
+  // Retain the Gateway assertion selected at admission; a later context
+  // property replacement must not substitute a new assertion after an await.
+  const invocationAssertion = context.assertInvocationCurrent;
+  if (invocationAssertion.call(context) === false) throw new Error('stale_invocation');
   const model = context.activeModel.modelRef;
   if (!MODEL.test(model)) throw new Error('candidate_context_unavailable');
   const candidate = Object.freeze({
@@ -36,7 +39,7 @@ export function admitCandidate(context, request) {
     if (!isEligibleGatewayContext(context) || context.activeModel.modelRef !== model) {
       throw new Error('candidate_context_unavailable');
     }
-    if (context.assertInvocationCurrent() === false) throw new Error('stale_invocation');
+    if (invocationAssertion.call(context) === false) throw new Error('stale_invocation');
   };
   return Object.freeze({ candidate, assertCurrent });
 }
