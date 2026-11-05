@@ -1,20 +1,31 @@
 # Inert worker image recipe (offline, not a deployment)
 
-`Containerfile` copies only the eight explicitly named Python files from
+`Containerfile` copies only the ten explicitly named Python files from
 `broker/worker` and `broker/transport`. Python modules are mode 0444; the
 strict askpass executable is mode 0555. The image does not
 copy tests, the repository checkout, Git objects, a signer public/private key,
 application key, token, credential, private configuration, or any host/socket
-identifier. The numeric image user is UID/GID 1 and the default entrypoint is
+identifier. The working directory is fixed at `/opt/publisher`, so a separately
+authorized `-m broker.worker.mount_probe_fixture` invocation can import the
+code without a runtime `PYTHONPATH` or private path. The numeric image user is
+UID/GID 1 and the default entrypoint is
 `/usr/bin/false`; neither creates an authenticated or usable publisher.
 `askpass.py` is not the image entrypoint and cannot obtain a token without a
 separately protected FD.
 
 ## Offline review and build procedure (operator-only; do not run as activation)
 
-Review the eight source files, the Containerfile, and the exact *local* base
+Review the ten source files, the Containerfile, and the exact *local* base
 image first. The base must provide the intended Python/Git/SSH dependencies and
-`/usr/bin/false`; audit its contents and inherited metadata independently. Set
+`/usr/bin/false`; in particular the host-side probe requires the interpreter
+at exactly `/usr/local/bin/python3` (not an alternative found through `PATH`).
+Before approving the base, independently inspect its local root filesystem and
+verify that this path exists, resolves within that filesystem, is executable by
+UID/GID 1, and is the intended Python 3 interpreter with the required standard
+library and dependencies. Reject the base if any check fails; image metadata
+alone does not establish the filesystem contract. Audit its other contents and
+inherited metadata independently. No private runtime path or environment
+variable may be used to repair a missing interpreter or module import. Set
 `BASE_IMAGE` to the operator-approved immutable reference ending in
 `@sha256:` followed by exactly 64 lowercase hexadecimal digits. It has no
 default. Containerfile syntax cannot validate the reference *before* `FROM`
@@ -47,6 +58,8 @@ paths = (
     'broker/worker/capture_once.py',
     'broker/worker/handoff.py',
     'broker/worker/verifier.py',
+    'broker/worker/mount_pin.py',
+    'broker/worker/mount_probe_fixture.py',
     'broker/transport/askpass.py',
     'broker/transport/git_adapter.py',
     'broker/transport/one_shot.py',

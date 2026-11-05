@@ -195,7 +195,10 @@ class Fixture(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_symlink_swap_at_open_and_private_empty_destination(self):
-        path = self.repo / ".git" / "objects" / "aa"
+        objects = self.repo / ".git" / "objects"
+        # Git can legitimately have objects in any fixed prefix after setup.
+        path = next((objects / f"{prefix:02x}" for prefix in range(256)
+                     if not (objects / f"{prefix:02x}").exists()))
         path.mkdir()
         target = self.root / "external"
         target.write_text("not an object")

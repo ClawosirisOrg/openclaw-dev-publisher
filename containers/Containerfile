@@ -7,8 +7,13 @@ FROM ${BASE_IMAGE}
 # An isolated build context must contain only these reviewed source files and
 # this Containerfile. Do not COPY a whole directory, checkout, keys or config.
 COPY --chmod=0444 broker/worker/__init__.py broker/worker/claim.py broker/worker/capture_once.py broker/worker/handoff.py broker/worker/verifier.py /opt/publisher/broker/worker/
+COPY --chmod=0444 broker/worker/mount_pin.py broker/worker/mount_probe_fixture.py /opt/publisher/broker/worker/
 COPY --chmod=0444 broker/transport/git_adapter.py broker/transport/one_shot.py /opt/publisher/broker/transport/
 COPY --chmod=0555 broker/transport/askpass.py /opt/publisher/broker/transport/askpass.py
+
+# The host probe uses the approved base's /usr/local/bin/python3 with -m;
+# module imports resolve from this fixed, code-only directory, not PYTHONPATH.
+WORKDIR /opt/publisher
 
 # This image is not an activated worker or a publisher. A later, separately
 # reviewed deployment must prove runtime UID, mounts, /proc and network policy.
