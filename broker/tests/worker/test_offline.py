@@ -79,6 +79,36 @@ class Fixture(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "disabled"):
             verifier.main()
 
+    def test_dirty_worktree_does_not_change_signed_candidate_snapshot(self):
+        # setUp signed the candidate before any of these worktree edits.
+        expected_tree = run("git", "rev-parse", "HEAD^{tree}", cwd=self.repo)
+        clean = self.capture()
+        clean_store = self.handoff / "store.git" / "objects"
+        clean_objects = {p.relative_to(clean_store): p.read_bytes()
+                         for p in clean_store.rglob("*") if p.is_file()}
+
+        self.fresh()
+        (self.repo / "file").write_text("unsaved tracked worktree content")
+        (self.repo / "untracked").write_text("unsaved untracked worktree content")
+        exclude = self.repo / ".git" / "info" / "exclude"
+        exclude.write_text(exclude.read_text() + "\nignored\n")
+        (self.repo / "ignored").write_text("unsaved ignored worktree content")
+        self.assertEqual(run("git", "check-ignore", "ignored", cwd=self.repo), "ignored")
+
+        dirty = self.capture()
+        dirty_store = self.handoff / "store.git"
+        dirty_objects = {p.relative_to(dirty_store / "objects"): p.read_bytes()
+                         for p in (dirty_store / "objects").rglob("*") if p.is_file()}
+        self.assertEqual(dirty["tree"], expected_tree)
+        self.assertEqual(dirty["tree"], clean["tree"])
+        for field in ("sha", "object_bytes", "object_entries", "objects_sha256"):
+            self.assertEqual(dirty[field], clean[field])
+        self.assertEqual(dirty_objects, clean_objects)
+        self.assertEqual(verifier.git(dirty_store, "show", self.invocation.sha + ":file"),
+                         b"candidate")
+        self.assertEqual(verifier.git(dirty_store, "ls-tree", "--name-only", dirty["tree"]),
+                         b"file\n")
+
     def test_wrong_base_signer_unsigned_and_trailers(self):
         wrong = verifier.Invocation(self.invocation.sha, self.invocation.branch, "a" * 40,
                                     self.invocation.model, self.invocation.thinking)
