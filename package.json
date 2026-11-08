@@ -2,19 +2,53 @@
   "name": "openclaw-dev-publisher-prototype",
   "version": "0.0.0",
   "private": true,
-  "description": "Inert Gateway-side signed dev-agent publication pattern prototype",
+  "description": "Signed dev-agent publication broker; production explicitly configured, default disabled",
   "type": "module",
   "license": "MIT",
   "openclaw": {
-    "extensions": ["./src/plugin.mjs"],
-    "compat": { "pluginApi": ">=2026.10.3" },
-    "install": { "minHostVersion": ">=2026.10.3" }
+    "extensions": [
+      "./src/plugin.mjs"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.10.3"
+    },
+    "install": {
+      "minHostVersion": ">=2026.10.3"
+    }
   },
-  "files": ["src/", "openclaw.plugin.json", "README.md", "LICENSE"],
+  "files": [
+    "src/",
+    "openclaw.plugin.json",
+    "README.md",
+    "PRODUCTION.md",
+    "LICENSE",
+    "broker/host/production.py",
+    "broker/host/production_runtime.py",
+    "broker/host/attempt_ledger.py",
+    "broker/host/stage_allocator.py",
+    "broker/host/podman_inert_probe.py",
+    "broker/host/podman_attach_probe.py",
+    "broker/issuer/read_base.py",
+    "broker/issuer/write_token.py",
+    "broker/issuer/write_lease.py",
+    "broker/worker/__init__.py",
+    "broker/worker/claim.py",
+    "broker/worker/capture_once.py",
+    "broker/worker/handoff.py",
+    "broker/worker/verifier.py",
+    "broker/worker/production.py",
+    "broker/worker/isolation.py",
+    "broker/transport/git_adapter.py",
+    "broker/transport/one_shot.py",
+    "broker/transport/askpass.py",
+    "broker/transport/production.py"
+  ],
   "scripts": {
     "test": "node --test",
     "test:python": "PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s broker/tests -p 'test_*.py' -q",
     "test:all": "npm test && npm run test:python"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

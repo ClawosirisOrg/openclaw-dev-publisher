@@ -1,6 +1,6 @@
 # Inert worker image recipe (offline, not a deployment)
 
-`Containerfile` copies only the ten explicitly named Python files from
+`Containerfile` copies only the thirteen explicitly named Python files from
 `broker/worker` and `broker/transport`. Python modules are mode 0444; the
 strict askpass executable is mode 0555. The image does not
 copy tests, the repository checkout, Git objects, a signer public/private key,
@@ -15,7 +15,7 @@ separately protected FD.
 
 ## Offline review and build procedure (operator-only; do not run as activation)
 
-Review the ten source files, the Containerfile, and the exact *local* base
+Review the thirteen source files, the Containerfile, and the exact *local* base
 image first. The base must provide the intended Python/Git/SSH dependencies and
 `/usr/bin/false`; in particular the host-side probe requires the interpreter
 at exactly `/usr/local/bin/python3` (not an alternative found through `PATH`).
@@ -63,6 +63,9 @@ paths = (
     'broker/transport/askpass.py',
     'broker/transport/git_adapter.py',
     'broker/transport/one_shot.py',
+    'broker/worker/production.py',
+    'broker/worker/isolation.py',
+    'broker/transport/production.py',
 )
 for name in paths:
     source = Path(name)
@@ -100,7 +103,7 @@ deployment artifacts**, independently recorded and verified by the operator.
 Building an image does not activate it or authorize a launch, token issuance,
 Git access or publication. `--network=none` above is a build-time setting;
 network-none/egress denial, limited and correctly owned mounts, read-only
-filesystem, protected `/proc`, distinct UID isolation and image identity are
+filesystem, protected `/proc`, explicit user-namespace mapping, mount/PID isolation and image identity are
 **launch-time guarantees**, not claims established by this Containerfile.
 There is no launch command here. Keep all host paths, socket identifiers,
 repository grants, signer keys and credentials out of the image and public

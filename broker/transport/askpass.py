@@ -1,5 +1,5 @@
-#!/usr/bin/python3
-"""Private Git askpass child: strict prompts, one-use FD, no CLI credential API."""
+#!/usr/local/bin/python3
+"""Confined worker askpass: pinned worker Python, strict prompt and one-use FD."""
 import os
 import re
 import select

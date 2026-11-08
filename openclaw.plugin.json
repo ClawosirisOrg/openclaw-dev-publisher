@@ -1,7 +1,7 @@
 {
   "id": "openclaw-dev-publisher",
-  "name": "Signed dev-agent publisher (inactive)",
-  "description": "Inert versioned admission interface; no publication capability",
+  "name": "Signed dev-agent publisher",
+  "description": "Disabled by default; explicit protected-config Gateway broker",
   "categories": [
     "developer-tools"
   ],
@@ -21,6 +21,39 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "properties": {}
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": [
+          "disabled",
+          "production"
+        ],
+        "default": "disabled"
+      },
+      "productionConfigPath": {
+        "type": "string",
+        "pattern": "^/",
+        "description": "Gateway-owned protected JSON path reference; never a key or token"
+      }
+    },
+    "allOf": [
+      {
+        "if": {
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "const": "production"
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "productionConfigPath"
+          ]
+        }
+      }
+    ]
   }
 }

@@ -124,7 +124,7 @@ class MountProbeFixtureTests(unittest.TestCase):
         whitelist = ast.literal_eval("(" + readme.split("paths = (", 1)[1].split(")\nfor name in paths:", 1)[0] + ")")
         self.assertEqual(len(whitelist), len(set(whitelist)))
         self.assertIn("containers/Containerfile", whitelist)
-        self.assertEqual(len(whitelist), 11)  # ten Python files and the recipe
+        self.assertEqual(len(whitelist), 14)  # thirteen Python files and the recipe
         instructions = [line for line in recipe.splitlines()
                         if line and not line.lstrip().startswith("#")]
         copied = []

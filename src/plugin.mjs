@@ -2,8 +2,10 @@
  * Disabled Gateway v2 admission entry. No issuer, transport, or write capability.
  */
 import { admitCandidate, isEligibleGatewayContext } from './context-contract.mjs';
+import { createProductionPlugin } from './production-plugin.mjs';
+import { loadProductionDeployment } from './production-config.mjs';
 
-export const publisherPlugin = {
+export const disabledPublisherPlugin = {
   id: 'openclaw-dev-publisher',
   name: 'Signed dev-agent publisher (disabled)',
   description: 'dev-syn admission only; publication is disabled',
@@ -38,6 +40,23 @@ export const publisherPlugin = {
         };
       },
     }, { name: 'request_signed_publication', optional: true });
+  },
+};
+export const publisherPlugin = {
+  id: 'openclaw-dev-publisher',
+  name: 'Signed dev-agent publisher',
+  description: 'Disabled by default; protected-config production is explicit',
+  register(api) {
+    const config = api.pluginConfig ?? {};
+    if (!config || typeof config !== 'object' || Array.isArray(config) ||
+        Object.keys(config).some(key => !['mode', 'productionConfigPath'].includes(key))) {
+      throw new Error('publisher_plugin_config_invalid');
+    }
+    if (config.mode === undefined || config.mode === 'disabled') {
+      disabledPublisherPlugin.register(api);
+    } else if (config.mode === 'production' && typeof config.productionConfigPath === 'string') {
+      createProductionPlugin(loadProductionDeployment(config.productionConfigPath)).register(api);
+    } else throw new Error('publisher_plugin_config_invalid');
   },
 };
 export default publisherPlugin;

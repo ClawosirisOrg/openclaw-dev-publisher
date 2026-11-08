@@ -1,13 +1,20 @@
-# Signed dev-agent publication: policy prototype
+# Signed dev-agent publication broker
 
-This is a **disabled** Gateway-side broker source repository, not an installed
-publisher or production deployment. The version-2 optional tool is scoped to a
-sandboxed development agent and always rejects publication. Its independent
-source modules cover admission, a one-use claim frame, read-base issuance,
-credential-free object verification, a dormant write-grant model, and one-shot
-Git transport fixtures. They are **not composed into a live write path**.
-No included entrypoint mints a write token or pushes to GitHub. Node.js 20+
-and Python 3 are needed for the complete offline test suite.
+This is source, **not an installed or live-verified deployment**. The default
+version-2 optional plugin remains disabled and always rejects publication.
+A separate explicit production factory now composes live admission, durable
+attempt reservation, isolated signed-object capture/reverification, selected
+App write issuance, one-create transport and remote readback. It requires a
+reviewed protected configuration and immutable worker image; the npm package
+ships the Node entry and Python runtime, but production is not enabled by
+default or any fixture flag. See
+[PRODUCTION.md](PRODUCTION.md) for the integration interface and live-proof
+requirements. Invoking that host entry with real credentials can write.
+Node.js 20+ and Python 3 are needed for the offline test suite.
+
+The following architecture notes describe the original disabled modules.
+Production composition and its remaining deployment gates are documented
+separately above; offline passing tests are never deployment authorization.
 
 ## Trust boundaries and threat model
 
@@ -79,7 +86,7 @@ container or socket object's identity just because that object claimed it.
 
 ## Per-publish transport boundary (design only)
 
-Future interface, **not implemented**:
+Original fixture boundary (operational composition: see PRODUCTION.md):
 
 ```text
 publish(signedCommit, approvedRepository, invocationContext):
@@ -98,8 +105,8 @@ or persistent Git credential helper. Separate SSH commit signing from Git
 transport and API authorization. Verify signed commit content and provenance
 before publication, require exact allowlist and owner authorization, reject
 replay, check remote state before write, and inspect the resulting remote
-artifact. Individual offline modules test parts of those controls; no composed
-or deployed publisher implements them end-to-end.
+artifact. The separate production source composes these controls; no deployed publisher
+has been verified end-to-end.
 
 ## Limitations and deployment notes
 
@@ -108,7 +115,7 @@ or deployed publisher implements them end-to-end.
   cannot undo external side effects. A real signer should enforce deadlines
   and identity **inside** its own service, with a request nonce, no reusable
   authority and one-operation semantics.
-- These adapters are abstractions only. There is no container-runtime client,
+- These original readiness adapters are abstractions only. They contain no container-runtime client,
   Unix socket protocol, cryptographic challenge, peer attestation, signature
   verification, privilege isolation or audit sink. Inject trusted monotonic
   time; prevent agent writes to Gateway configuration and socket.
@@ -134,8 +141,9 @@ The public repository contains broker source under `src/`, `broker/issuer/`,
 `broker/worker/`, and `broker/transport/`; a no-default, disabled worker image
 recipe is under `containers/`. Offline tests are under `test/` and
 `broker/tests/`. Run `npm run test:all` to check both Node and Python fixtures.
-The current npm package allowlist includes only `src/` and plugin metadata;
-putting source in Git is not an installed worker or a deployment. Keys, tokens,
+The npm allowlist includes Node entry/metadata and the explicit Python runtime
+closure, excluding tests and private data. Putting source in Git or an archive
+is not an installed worker or a live deployment. Keys, tokens,
 actual App IDs, signer pins, image locks, and host paths belong only in a
 separately reviewed private deployment configuration, never this repository.
 

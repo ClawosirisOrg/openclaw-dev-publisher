@@ -10,6 +10,9 @@ COPY --chmod=0444 broker/worker/__init__.py broker/worker/claim.py broker/worker
 COPY --chmod=0444 broker/worker/mount_pin.py broker/worker/mount_probe_fixture.py /opt/publisher/broker/worker/
 COPY --chmod=0444 broker/transport/git_adapter.py broker/transport/one_shot.py /opt/publisher/broker/transport/
 COPY --chmod=0555 broker/transport/askpass.py /opt/publisher/broker/transport/askpass.py
+# Production entry source; no issuer, host code, config or credentials in image.
+COPY --chmod=0444 broker/worker/production.py broker/worker/isolation.py /opt/publisher/broker/worker/
+COPY --chmod=0444 broker/transport/production.py /opt/publisher/broker/transport/production.py
 
 # The host probe uses the approved base's /usr/local/bin/python3 with -m;
 # module imports resolve from this fixed, code-only directory, not PYTHONPATH.

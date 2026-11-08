@@ -18,6 +18,7 @@ import unicodedata
 
 OID = re.compile(r"[0-9a-f]{40}\Z")
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+AGENT = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+:-]{0,127}\Z")
 FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
@@ -54,7 +55,7 @@ class DeployConfig:
         match(self.repository, REPO, "repository")
         if self.base_ref != "refs/heads/main":
             raise ValueError("base ref")
-        match(self.agent, NAME, "agent")
+        match(self.agent, AGENT, "agent")
         match(self.bot_owner, NAME, "bot owner")
         match(self.branch_prefix, NAME, "branch prefix")
         match(self.source_component, NAME, "source component")
