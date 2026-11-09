@@ -55,7 +55,10 @@ class _DeployTarget:
         return f"https://{_HOST}/{self.owner}/{self.name}.git"
 
 
-def _argv(target, operation, ref, sha=None):
+def _argv(target, operation, ref, sha=None, expected_old=None):
+    if expected_old is not None and (operation != "update" or type(expected_old) is not str
+            or not _SHA.fullmatch(expected_old) or expected_old == sha):
+        raise GitAdapterError("invalid expected old sha")
     if type(target) is not _DeployTarget:
         raise GitAdapterError("invalid deployment target")
     if operation == "main" and ref == "refs/heads/main" and sha is None:
@@ -68,6 +71,11 @@ def _argv(target, operation, ref, sha=None):
         elif operation == "create" and type(sha) is str and _SHA.fullmatch(sha):
             command = ["push", "--porcelain", "--no-verify", "--no-follow-tags",
                        "--force-with-lease=" + ref + ":", target.remote, sha + ":" + ref]
+        elif (operation == "update" and type(sha) is str and _SHA.fullmatch(sha)
+              and type(expected_old) is str and _SHA.fullmatch(expected_old)):
+            command = ["push", "--porcelain", "--no-verify", "--no-follow-tags",
+                       "--force-with-lease=" + ref + ":" + expected_old,
+                       target.remote, sha + ":" + ref]
         else:
             raise GitAdapterError("invalid Git operation")
     else:
@@ -109,18 +117,24 @@ def _collect(process, deadline):
     return bytes(output)
 
 
-def _run(target, operation, ref, token_fd, *, sha=None):
+def _run(target, operation, ref, token_fd, *, sha=None, expected_old=None):
     """Internal one-command seam; caller supplies a fresh private pipe per call.
 
     Deployer must authorize before issuing and revoke in finally. This module
     cannot authenticate the caller or guarantee a protected process boundary.
     """
     try:
-        argv = _argv(target, operation, ref, sha)
-    except GitAdapterError:
+        argv = _argv(target, operation, ref, sha, expected_old)
+        if operation == "update":
+            # Independent sterile-store ancestry check before network or push.
+            from broker.worker.verifier import git
+            if git(target.store, "rev-list", "--parents", "-n", "1", sha).strip() != (sha + " " + expected_old).encode():
+                raise GitAdapterError("not a direct-child fast forward")
+            git(target.store, "merge-base", "--is-ancestor", expected_old, sha)
+    except (GitAdapterError, ValueError):
         if type(token_fd) is int and token_fd >= 0:
             os.close(token_fd)
-        raise
+        raise GitAdapterError("invalid operation or non-fast-forward") from None
     env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
            "XDG_CONFIG_HOME": "/nonexistent", "LC_ALL": "C",
            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",

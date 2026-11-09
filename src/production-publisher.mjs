@@ -28,6 +28,12 @@ export function createProductionPublisher(config) {
       // Thinking is temporarily agent-attested by explicit owner decision.
       // Model identity is still exclusively the retained Gateway observation.
       const { candidate, assertCurrent } = admitCandidate(context, request);
+      const inspect = ['inspect-mint', 'inspect-deliver'];
+      const operation = candidate.operation ?? 'create';
+      const expectedPhases = ['issue', 'pr'].includes(operation)
+        ? [...inspect, 'api-mint', 'api-deliver', 'api-write']
+        : operation === 'reconcile' ? inspect
+          : operation === 'update' ? [...phases.slice(0, 3), ...inspect, ...phases.slice(3), ...inspect] : phases;
       if (typeof toolCallId !== 'string' || !/^[!-~]{1,512}$/.test(toolCallId)) {
         throw new Error('trusted_tool_call_id_unavailable');
       }
@@ -71,23 +77,30 @@ export function createProductionPublisher(config) {
             if (failed) return;
             try {
               total += chunk.length;
-              if (total > 16384) throw failure();
+              if (total > 131072) throw failure();
               pending += chunk.toString('utf8');
-              if (pending.length > 8192) throw failure();
+              if (pending.length > 65536) throw failure();
               for (;;) {
                 const index = pending.indexOf('\n');
                 if (index < 0) break;
                 const line = pending.slice(0, index);
                 pending = pending.slice(index + 1);
-                if (line.length > 4096 || result) throw failure();
+                if (line.length > 65536 || result) throw failure();
                 const message = JSON.parse(line);
                 if (ownKeys(message, ['guard', 'nonce']) &&
-                    message.guard === phases[phase] && /^[0-9a-f]{32}$/.test(message.nonce)) {
+                    message.guard === expectedPhases[phase] && /^[0-9a-f]{32}$/.test(message.nonce)) {
                   phase++;
                   send({ allow: message.guard, nonce: message.nonce });
-                } else if (ownKeys(message, ['result']) && phase === phases.length) {
+                } else if (ownKeys(message, ['result']) && phase === expectedPhases.length) {
                   const r = message.result;
-                  if (!ownKeys(r, ['sha', 'branch', 'base', 'acknowledged', 'readback_checked',
+                  if (['issue', 'pr', 'reconcile'].includes(operation)) {
+                    if (!ownKeys(r, ['number', 'url', 'head', 'readback_checked']) ||
+                        !Number.isSafeInteger(r.number) || r.number < 1 ||
+                        r.head !== candidate.sha || r.readback_checked !== true ||
+                        typeof r.url !== 'string' ||
+                        !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(issues|pull)\/[1-9][0-9]*$/.test(r.url) ||
+                        !r.url.endsWith('/' + r.number)) throw failure();
+                  } else if (!ownKeys(r, ['sha', 'branch', 'base', 'acknowledged', 'readback_checked',
                       'main_at_readback', 'stale']) || r.sha !== candidate.sha ||
                       r.branch !== candidate.branch || !/^[0-9a-f]{40}$/.test(r.base) ||
                       !/^[0-9a-f]{40}$/.test(r.main_at_readback) ||
@@ -113,7 +126,10 @@ export function createProductionPublisher(config) {
           });
           signal?.addEventListener('abort', onAbort, { once: true });
           send({ attempt, sha: candidate.sha, branch: candidate.branch,
-            model: candidate.model, thinking: candidate.thinking });
+            model: candidate.model, thinking: candidate.thinking,
+            ...(candidate.operation ? { operation: candidate.operation } : {}),
+            ...(candidate.expectedOldSha ? { expectedOldSha: candidate.expectedOldSha } : {}),
+            ...(['issue', 'pr'].includes(operation) ? { title: candidate.title, body: candidate.body } : {}) });
         } catch {
           if (child) stop();
           else reject(failure());

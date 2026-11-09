@@ -83,7 +83,7 @@ test('real offline npm archive ships complete Python closure and loadable operat
   execFileSync('tar', ['-xf', join(f.dir, packed.filename), '-C', extracted], { env, timeout: 5000 });
   const installed = join(extracted, 'package');
   execFileSync('/usr/bin/python3', ['-B', '-c',
-    'import broker.host.production, broker.host.production_runtime, broker.issuer.write_lease, broker.worker.production, broker.transport.production'],
+    'import broker.host.production, broker.host.production_runtime, broker.host.namespace_ledger, broker.host.github_workflow, broker.issuer.write_lease, broker.issuer.api_lease, broker.issuer.api_readiness, broker.worker.production, broker.transport.production'],
     { cwd: installed, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
   const host = spawnSync('/usr/bin/python3', ['-B', '-m', 'broker.host.production'],
     { cwd: installed, env, encoding: 'utf8', timeout: 5000 });

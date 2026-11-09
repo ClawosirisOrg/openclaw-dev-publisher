@@ -14,8 +14,24 @@ export function isEligibleGatewayContext(context) {
 /** No returned value is a permit to write, sign, or publish. */
 export function admitCandidate(context, request) {
   if (!isEligibleGatewayContext(context)) throw new Error('candidate_context_unavailable');
-  if (!request || typeof request !== 'object' || Array.isArray(request) ||
-      Object.keys(request).sort().join(',') !== 'branch,commitSha,thinking') {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    throw new Error('candidate_request_invalid');
+  }
+  const operation = Object.hasOwn(request, 'operation') ? request.operation : 'create';
+  if (!['create', 'update', 'issue', 'pr', 'reconcile'].includes(operation)) {
+    throw new Error('candidate_request_invalid');
+  }
+  const expectedKeys = ['branch', 'commitSha', 'thinking'];
+  if (Object.hasOwn(request, 'operation')) expectedKeys.push('operation');
+  if (operation === 'update') expectedKeys.push('expectedOldSha');
+  if (operation === 'issue' || operation === 'pr') expectedKeys.push('title', 'body');
+  if (Object.keys(request).sort().join(',') !== expectedKeys.sort().join(',') ||
+      (operation === 'update' && (typeof request.expectedOldSha !== 'string' ||
+       !SHA.test(request.expectedOldSha) || request.expectedOldSha === request.commitSha)) ||
+      (['issue', 'pr'].includes(operation) &&
+       (typeof request.title !== 'string' || Buffer.byteLength(request.title, 'utf8') > 200 ||
+        !request.title.length || typeof request.body !== 'string' ||
+        !request.body.length || Buffer.byteLength(request.body, 'utf8') > 12000))) {
     throw new Error('candidate_request_invalid');
   }
   const { commitSha, branch, thinking } = request;
@@ -34,6 +50,9 @@ export function admitCandidate(context, request) {
     sha: commitSha, branch, model, thinking,
     model_source: 'gateway_active_model',
     thinking_source: 'agent_attested',
+    ...(Object.hasOwn(request, 'operation') ? { operation } : {}),
+    ...(operation === 'update' ? { expectedOldSha: request.expectedOldSha } : {}),
+    ...(['issue', 'pr'].includes(operation) ? { title: request.title, body: request.body } : {}),
   });
   const assertCurrent = () => {
     if (!isEligibleGatewayContext(context) || context.activeModel.modelRef !== model) {

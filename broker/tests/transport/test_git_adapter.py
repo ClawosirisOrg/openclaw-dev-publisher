@@ -65,6 +65,22 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             adapter.main("publish")
 
+    def test_update_requires_explicit_exact_old_lease_and_safe_only_ref(self):
+        old = 'a' * 40
+        push = adapter._argv(self.target, "update", REF, SHA, old)
+        self.assertEqual(push[-3:], ["--force-with-lease=" + REF + ":" + old,
+                                     self.target.remote, SHA + ":" + REF])
+        self.assertNotIn("--force", push)
+        self.assertFalse(any(arg.startswith('+') for arg in push))
+        for op, ref, sha, expected in (
+                ("update", REF, SHA, None), ("update", REF, SHA, SHA),
+                ("update", "refs/heads/main", SHA, old),
+                ("update", "refs/tags/release", SHA, old),
+                ("update", "refs/heads/other/branch", SHA, old),
+                ("update", REF, '', old), ("create", REF, SHA, old)):
+            with self.subTest(op=op, ref=ref, expected=expected), self.assertRaises(adapter.GitAdapterError):
+                adapter._argv(self.target, op, ref, sha, expected)
+
     def test_target_not_candidate_url_and_outside_checkout(self):
         for owner, name in (("https://other.invalid", "repo"), ("..", "repo"),
                             ("owner", "repo/other"), ("owner", "name.lock")):

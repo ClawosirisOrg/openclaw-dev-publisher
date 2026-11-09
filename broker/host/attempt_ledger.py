@@ -120,24 +120,26 @@ class AttemptLedger:
             os.close(fd)
 
     @contextlib.contextmanager
-    def _locked(self):
+    def _locked(self, name='.lock'):
+        if name != '.lock' and (type(name) is not str or not re.fullmatch(r'n-[0-9a-f]{32}\.lock', name)):
+            raise LedgerError('invalid lock name')
         self._check_directory()
         try:
             # Only the exclusive creator may repair the umask-restricted mode.
             # An existing malformed lock is never normalized or replaced.
             try:
-                fd = os.open('.lock', os.O_RDWR | os.O_CREAT | os.O_EXCL | _FLAGS,
+                fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | _FLAGS,
                              0o600, dir_fd=self._fd)
                 created = True
             except FileExistsError:
-                fd = os.open('.lock', os.O_RDWR | _FLAGS, dir_fd=self._fd)
+                fd = os.open(name, os.O_RDWR | _FLAGS, dir_fd=self._fd)
                 created = False
         except OSError as exc:
             raise LedgerError('unsafe lock') from exc
         try:
             if created:
                 info = os.fstat(fd)
-                named = os.stat('.lock', dir_fd=self._fd, follow_symlinks=False)
+                named = os.stat(name, dir_fd=self._fd, follow_symlinks=False)
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != self._uid
                         or info.st_nlink != 1
                         or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)):
@@ -146,7 +148,7 @@ class AttemptLedger:
             self._check_file(fd)
             fcntl.flock(fd, fcntl.LOCK_EX)
             info = self._check_file(fd)
-            named = os.stat('.lock', dir_fd=self._fd, follow_symlinks=False)
+            named = os.stat(name, dir_fd=self._fd, follow_symlinks=False)
             if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
                 raise LedgerError('lock inode changed')
             # The lock is durable before any marker mutation; another opener

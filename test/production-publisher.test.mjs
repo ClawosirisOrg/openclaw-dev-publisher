@@ -15,7 +15,7 @@ const context = () => ({ agentId: 'dev-syn', sandboxed: true,
 const outcome = { sha: request.commitSha, branch: request.branch, base: 'b'.repeat(40),
   acknowledged: true, readback_checked: true, main_at_readback: 'b'.repeat(40), stale: false };
 
-function fakeProcess(t, { beforePhase = () => {}, corruptPhase, result = outcome } = {}) {
+function fakeProcess(t, { beforePhase = () => {}, corruptPhase, result = outcome, expectedPhases = phases } = {}) {
   const observations = { inputs: [], killed: [], spawned: [] };
   t.mock.method(childProcess, 'spawn', (...args) => {
     observations.spawned.push(args);
@@ -30,8 +30,8 @@ function fakeProcess(t, { beforePhase = () => {}, corruptPhase, result = outcome
       callback();
       queueMicrotask(() => {
         if (closed) return;
-        if (index < phases.length) {
-          const phase = phases[index++];
+        if (index < expectedPhases.length) {
+          const phase = expectedPhases[index++];
           beforePhase(phase);
           child.stdout.write(JSON.stringify({ guard: phase === corruptPhase ? 'invalid' : phase,
             nonce: 'c'.repeat(32) }) + '\n');
@@ -131,4 +131,46 @@ test('production plugin is explicit, optional, dev-syn-only and contextVersion t
   assert.match(tool.parameters.properties.thinking.description, /not Gateway-authenticated/);
   assert.equal(io.spawned.length, 0);
   assert.throws(() => createProductionPublisher({ ...config }), /config_unavailable/);
+});
+
+
+test('guarded update forwards only explicit expected-old and retained runtime', async t => {
+  const inspect = ['inspect-mint', 'inspect-deliver'];
+  const expectedPhases = [...phases.slice(0, 3), ...inspect, ...phases.slice(3), ...inspect];
+  const io = fakeProcess(t, { expectedPhases });
+  await createProductionPublisher(config).run(context(), 'review-fix', {
+    ...request, operation: 'update', expectedOldSha: 'b'.repeat(40),
+  });
+  assert.equal(io.inputs[0].operation, 'update');
+  assert.equal(io.inputs[0].expectedOldSha, 'b'.repeat(40));
+  assert.deepEqual(io.inputs.slice(1).map(v => v.allow), expectedPhases);
+});
+
+test('issue/PR and read-only reconciliation retain freshness fences and bounded URLs', async t => {
+  for (const operation of ['issue', 'pr', 'reconcile']) {
+    const expectedPhases = ['inspect-mint', 'inspect-deliver',
+      ...(operation === 'reconcile' ? [] : ['api-mint', 'api-deliver', 'api-write'])];
+    const result = { number: 12, url: 'https://github.com/fixture/repo/' +
+      (operation === 'issue' ? 'issues' : 'pull') + '/12', head: request.commitSha, readback_checked: true };
+    const io = fakeProcess(t, { expectedPhases, result });
+    const artifact = operation === 'reconcile' ? {} : { title: 'Bounded title', body: 'Host validates attribution' };
+    assert.deepEqual(await createProductionPublisher(config).run(context(), 'api-' + operation,
+      { ...request, operation, ...artifact }), result);
+    assert.equal(io.inputs[0].operation, operation);
+    assert.deepEqual(io.inputs.slice(1).map(v => v.allow), expectedPhases);
+    t.mock.restoreAll();
+  }
+});
+
+test('stale original API invocation never permits artifact POST', async t => {
+  let current = true;
+  const c = context(); c.assertInvocationCurrent = () => current;
+  const expectedPhases = ['inspect-mint', 'inspect-deliver', 'api-mint', 'api-deliver', 'api-write'];
+  const io = fakeProcess(t, { expectedPhases, beforePhase(phase) {
+    if (phase === 'api-write') { current = false; c.assertInvocationCurrent = () => true; }
+  } });
+  await assert.rejects(createProductionPublisher(config).run(c, 'api-expired', {
+    ...request, operation: 'issue', title: 'Title', body: 'Body',
+  }), /inspect_no_retry/);
+  assert.equal(io.inputs.some(v => v.allow === 'api-write'), false);
 });

@@ -1,7 +1,8 @@
 # Signed dev-agent publication broker
 
 This is source, **not an installed or live-verified deployment**. The default
-version-2 optional plugin remains disabled and always rejects publication.
+version-2 optional plugin is disabled by default; explicit protected production
+config enables the reviewed broker, never direct sandbox credentials.
 A separate explicit production factory now composes live admission, durable
 attempt reservation, isolated signed-object capture/reverification, selected
 App write issuance, one-create transport and remote readback. It requires a
@@ -158,3 +159,18 @@ installation/allowlisting and the first live branch probe require separate
 owner review and authorization.
 
 License: MIT.
+
+
+## Namespace and review workflow extension
+
+The operational candidate now supports host-bound dev-syn namespace creation,
+durable publisher ownership and explicit-expected-old signed direct-child review
+updates, plus a separate-lease issue-first PR path to fixed main. It never merges,
+writes main, retargets, deletes, adopts other agents' branches or clears spent
+legacy attempts. New API creates are journaled before effects; uncertain or
+duplicate outcomes are read-only reconciled, never repeated. Cleanup/revocation
+uncertainty still blocks success. See [PRODUCTION.md](PRODUCTION.md) for the exact
+input/policy schemas, disjoint permission profiles, package entrypoints, ledger
+migration, API limitations, actual-grant readiness worker, and BOTH agent/profile
+and sandbox optional-tool admission. No deployment, live grant, image confinement
+or external publication is established by these offline tests.

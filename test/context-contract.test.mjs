@@ -84,3 +84,20 @@ test('expiration after admission and revoked sandbox invalidate the closure', ()
   host.sandboxed = false;
   assert.throws(admitted.assertCurrent, /candidate_context_unavailable/);
 });
+
+
+test('exact operation schemas reject widening and absent expected-old', () => {
+  for (const extra of [
+    { operation: null }, { operation: 'merge' }, { operation: 'update' },
+    { operation: 'update', expectedOldSha: request.commitSha },
+    { operation: 'create', expectedOldSha: 'b'.repeat(40) },
+    { operation: 'issue', title: 'Title' },
+    { operation: 'pr', title: 'Title', body: 'Body', base: 'other' },
+    { operation: 'issue', title: 'Title', body: 'Body', repository: 'foreign/repo' },
+    { operation: 'reconcile', title: 'Title', body: 'Body' },
+  ]) assert.throws(() => admitCandidate(context(), { ...request, ...extra }), /request_invalid/);
+  for (const operation of ['issue', 'pr']) {
+    const value = admitCandidate(context(), { ...request, operation, title: 'Title', body: 'Body' });
+    assert.equal(value.candidate.operation, operation);
+  }
+});

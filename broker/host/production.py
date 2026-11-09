@@ -19,6 +19,8 @@ import time
 from dataclasses import asdict
 
 from broker.host.attempt_ledger import AttemptLedger
+from broker.host.namespace_ledger import BranchJournal, namespace_policy
+from broker.host.github_workflow import GithubWorkflow, API_PHASES, INSPECT_PHASES
 from broker.host.stage_allocator import StageAllocator
 from broker.host.production_runtime import Session
 from broker.issuer import read_base
@@ -59,7 +61,7 @@ def load_config(path):
     fd = read_base._private_file(path, 16384)
     with os.fdopen(fd, 'rb') as stream:
         data = read_base._strict_json(stream.read(16385))
-    if type(data) is not dict or set(data) != KEYS:
+    if type(data) is not dict or set(data) not in (KEYS, (KEYS - {'approved_branch'}) | {'publication_policy', 'api_app_config'}):
         raise ValueError('invalid production config')
     for name in ('source_host', 'stage_root', 'stage_host_root', 'ledger_root', 'runtime_socket', 'app_config'):
         value = data[name]
@@ -84,7 +86,12 @@ def load_config(path):
     if (policy.repository != app.repository or policy.branch_prefix != 'dev-syn' or
             policy.base_ref != 'refs/heads/main'):
         raise ValueError('deployment target mismatch')
-    if type(data['approved_branch']) is not str or not claim.BRANCH.fullmatch(data['approved_branch']):
+    if 'publication_policy' in data:
+        namespace_policy(data, app, policy)
+        api_app = read_base.load_deploy_config(data['api_app_config'])
+        if api_app.repository != app.repository:
+            raise ValueError('API credential repository mismatch')
+    elif type(data['approved_branch']) is not str or not claim.BRANCH.fullmatch(data['approved_branch']):
         raise ValueError('invalid approved branch')
     if (type(data['deployment_id']) is not str or
             not re.fullmatch('[a-z0-9-]{1,64}', data['deployment_id']) or
@@ -99,7 +106,7 @@ def load_config(path):
 def read_line(fd=0, *, timeout=5.0):
     raw = bytearray()
     deadline = time.monotonic() + timeout
-    while len(raw) <= 4096:
+    while len(raw) <= 32768:
         left = deadline - time.monotonic()
         if left <= 0 or not select.select([fd], [], [], left)[0]:
             raise ValueError('gateway channel expired')
@@ -117,8 +124,8 @@ def write_line(body):
 
 
 class LiveGuard:
-    def __init__(self):
-        self._next = iter(PHASES)
+    def __init__(self, phases=PHASES):
+        self._next = iter(phases)
 
     def check(self, phase):
         if next(self._next, None) != phase:
@@ -149,27 +156,37 @@ def config_pin(config):
 
 
 def validate_request(body):
-    if (type(body) is not dict or set(body) != {'attempt', 'sha', 'branch', 'model', 'thinking'} or
+    if type(body) is not dict:
+        raise ValueError('invalid gateway request')
+    required = {'attempt', 'sha', 'branch', 'model', 'thinking'}
+    operation = body.get('operation', 'create')
+    extra = {'operation'} if 'operation' in body else set()
+    if operation == 'update':
+        extra.add('expectedOldSha')
+    elif operation in ('issue', 'pr'):
+        extra.update(('title', 'body'))
+    elif operation not in ('create', 'reconcile'):
+        raise ValueError('invalid operation')
+    if (set(body) != required | extra or
             type(body['attempt']) is not str or not claim.ID.fullmatch(body['attempt']) or
             type(body['sha']) is not str or not claim.SHA.fullmatch(body['sha']) or
             type(body['branch']) is not str or not claim.BRANCH.fullmatch(body['branch']) or
             type(body['model']) is not str or not claim.MODEL.fullmatch(body['model']) or
             type(body['thinking']) is not str or body['thinking'] not in claim.THINKING):
         raise ValueError('invalid gateway request')
+    if operation == 'update' and (type(body['expectedOldSha']) is not str or
+            not claim.SHA.fullmatch(body['expectedOldSha']) or body['expectedOldSha'] == body['sha']):
+        raise ValueError('invalid expected old sha')
+    if operation in ('issue', 'pr') and (type(body['title']) is not str or type(body['body']) is not str):
+        raise ValueError('invalid artifact text')
 
 
 def publication_key(repository, branch):
     return hashlib.sha256((repository.casefold() + '\0' + branch).encode('ascii')).hexdigest()[:32]
 
 
-def run(data, app, policy, body, guard):
+def _publish(data, app, policy, body, guard, review_check=None):
     """Operational composition. Inputs come ONLY from private deployment/channel."""
-    validate_request(body)
-    if body['branch'] != data['approved_branch']:
-        raise ValueError('unapproved branch')
-    # One approved repository/ref is one lifetime publication attempt, NOT
-    # one tool-call ID. A new call ID cannot retry an uncertain/failed write.
-    body = {**body, 'attempt': publication_key(app.repository, data['approved_branch'])}
     stage_fd = protected_directory(data['stage_root'])
     try:
         ledger_fd = protected_directory(data['ledger_root'])
@@ -184,7 +201,7 @@ def run(data, app, policy, body, guard):
             try:
                 guard.check('base')
                 base = read_base.BaseIssuer(app).current_main()
-                payload = worker_payload(body, base, policy, allocation)
+                payload = worker_payload(body, body.get('expectedOldSha', base), policy, allocation)
                 stage_host = data['stage_host_root'] + '/' + allocation.label
                 for operation in ('capture', 'reverify'):
                     guard.check(operation)
@@ -209,6 +226,9 @@ def run(data, app, policy, body, guard):
                     elif observed != captured:
                         raise ValueError('independent object verification mismatch')
 
+                if review_check is not None:
+                    review_check()
+
                 def transport(token):
                     session = Session(data['runtime_socket'], data['image_id'], 'transport',
                         [(stage_host + '/publish/store.git', '/store', True)],
@@ -218,8 +238,11 @@ def run(data, app, policy, body, guard):
                         # Startup/readiness may await; fence again immediately
                         # before the only bearer write to the private channel.
                         guard.check('handoff')
-                        session.send({'repository': policy.repository, 'sha': body['sha'],
-                            'branch': body['branch'], 'base': base, 'token': token})
+                        transport_body = {'repository': policy.repository, 'sha': body['sha'],
+                            'branch': body['branch'], 'base': base, 'token': token}
+                        if 'expectedOldSha' in body:
+                            transport_body['expected_old'] = body['expectedOldSha']
+                        session.send(transport_body)
                         if session.receive() != {'guard': 'create'}:
                             raise ValueError('invalid transport preflight')
                         guard.check('create')
@@ -249,10 +272,90 @@ def run(data, app, policy, body, guard):
                 # Its attempted tombstone remains permanent in either case.
                 if all(session.terminated for session in sessions):
                     allocator.quarantine(allocation, worker_terminated=True)
+                else:
+                    raise ValueError('worker cleanup uncertain; inspect no retry')
         finally:
             os.close(ledger_fd)
     finally:
         os.close(stage_fd)
+
+
+def run(data, app, policy, body, guard):
+    validate_request(body)
+    operation = body.get('operation', 'create')
+    if 'publication_policy' not in data:
+        if operation != 'create' or body['branch'] != data['approved_branch']:
+            raise ValueError('unapproved branch or legacy operation')
+        body = {**body, 'attempt': publication_key(app.repository, data['approved_branch'])}
+        return _publish(data, app, policy, body, guard)
+    p = namespace_policy(data, app, policy)
+    fd = protected_directory(data['ledger_root'])
+    try:
+        ledger = AttemptLedger(fd, expected_uid=os.geteuid())
+        with BranchJournal(ledger, p['actor'], app.repository, body['branch']).locked() as journal:
+            # Never silently adopt/retry a legacy spent branch, even if it has
+            # no remote ref or the remote happens to contain the requested SHA.
+            if ledger.state(publication_key(app.repository, body['branch'])) is not None:
+                raise ValueError('legacy spent branch; owner reconciliation required')
+            provenance = {'actor': p['actor'], 'agent': policy.agent, 'model': body['model'],
+                'model_source': 'gateway_active_model', 'thinking': body['thinking'],
+                'thinking_source': 'agent_attested', 'signer_fingerprint': policy.signer_fingerprint,
+                'credential_repository': app.repository,
+                'contents_credential': {'app_id': app.app_id, 'installation_id': app.installation_id},
+                'invocation_correlation': body['attempt']}
+            if operation in ('issue', 'pr', 'reconcile'):
+                api_app = read_base.load_deploy_config(data['api_app_config'])
+                if api_app.repository != app.repository:
+                    raise ValueError('API credential repository mismatch')
+                provenance['api_credential'] = {'app_id': api_app.app_id, 'installation_id': api_app.installation_id}
+                workflow = GithubWorkflow(api_app, policy, p['api_author'])
+                try:
+                    return workflow.run(journal, body, guard, provenance)
+                finally:
+                    pending = journal.pending()
+                    if (pending is not None and pending['kind'] in ('issue', 'pr') and
+                            workflow.cleanup_confirmed and operation != 'reconcile'):
+                        journal.confirm_cleanup(pending)
+            if journal.pending():
+                raise ValueError('unresolved operation; inspect no retry')
+            owned = journal.latest('create', 'update')
+            if operation == 'create' and owned is not None:
+                raise ValueError('branch already owned; use expected-old update')
+            if operation == 'update':
+                if owned is None or owned['intent']['new'] != body['expectedOldSha']:
+                    raise ValueError('not a proven publisher-owned expected head')
+                # The signer pin cannot change underneath an existing branch.
+                if owned['intent']['provenance']['signer_fingerprint'] != policy.signer_fingerprint:
+                    raise ValueError('branch signer changed')
+            intent = journal.reserve(operation, body.get('expectedOldSha'), body['sha'], provenance)
+            if operation == 'update':
+                api_app = read_base.load_deploy_config(data['api_app_config'])
+                if api_app.repository != app.repository:
+                    raise ValueError('API credential repository mismatch')
+                workflow = GithubWorkflow(api_app, policy, p['api_author'])
+                review_check = lambda: workflow.check_review_head(
+                    journal, body['branch'], body['expectedOldSha'], guard)
+            else:
+                review_check = None
+            result = _publish(data, app, policy,
+                              {**body, 'attempt': journal.operation_key(intent)}, guard, review_check)
+            if operation == 'update':
+                workflow.check_review_head(journal, body['branch'], body['sha'], guard)
+            journal.complete(intent, result)  # only after revocation + cleanup
+            return result
+    finally:
+        os.close(fd)
+
+
+def request_phases(body):
+    operation = body.get('operation', 'create')
+    if operation in ('issue', 'pr'):
+        return API_PHASES
+    if operation == 'reconcile':
+        return INSPECT_PHASES
+    if operation == 'update':
+        return PHASES[:3] + INSPECT_PHASES + PHASES[3:] + INSPECT_PHASES
+    return PHASES
 
 
 def main():
@@ -280,7 +383,7 @@ def main():
     signal.alarm(600)
     data, app, policy = load_config(sys.argv[1])
     body = read_line()
-    result = run(data, app, policy, body, LiveGuard())
+    result = run(data, app, policy, body, LiveGuard(request_phases(body)))
     write_line({'result': result})
 
 

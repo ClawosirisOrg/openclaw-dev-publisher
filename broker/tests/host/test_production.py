@@ -88,16 +88,18 @@ class ProductionComposition(unittest.TestCase):
                     request = self.initial
                     store = self.mounts[0][0]
                     target = SimpleNamespace(remote=str(owner.remote))
-                    def call(operation, ref, sha=None):
+                    def call(operation, ref, sha=None, expected_old=None):
                         if operation in ('main', 'branch'):
                             return verifier.git(store, 'ls-remote', str(owner.remote), ref)
                         owner.events.append('local-create')
+                        if expected_old and getattr(owner, 'race_update', False):
+                            fixture.run('git', '--git-dir=' + str(owner.remote), 'update-ref', ref, owner.base, expected_old)
                         if owner.uncertain_create:
                             raise ValueError('fixture remote write response lost; branch absent')
                         return verifier.git(store, 'push', '--porcelain', '--no-verify', '--no-follow-tags',
-                            '--force-with-lease=' + ref + ':', str(owner.remote), sha + ':' + ref)
+                            '--force-with-lease=' + ref + ':' + (expected_old or ''), str(owner.remote), sha + ':' + ref)
                     result = create_once(target, request['sha'], request['branch'], request['base'],
-                                         call=call, guard=lambda: True)
+                                         call=call, guard=lambda: True, expected_old=request.get('expected_old'))
                     self.outputs.append({'result': result})
             def receive(self): return self.outputs.popleft()
             def finish(self): pass

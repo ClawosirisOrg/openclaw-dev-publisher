@@ -5,6 +5,7 @@ private duplex stdin/stdout. One write attempt; acknowledgments require exact
 porcelain plus remote ref readback. No retry or cleanup ref operation exists.
 """
 import os
+import re
 import sys
 import time
 
@@ -28,9 +29,12 @@ def _pipe(token):
     return reader
 
 
-def create_once(target, sha, branch, base, *, call, guard, clock=time.monotonic):
+def create_once(target, sha, branch, base, *, call, guard, clock=time.monotonic, expected_old=None):
     """Trust comes from the host-owned process/pipe and image, not these args."""
     _request(sha, branch, base)
+    if expected_old is not None and (type(expected_old) is not str or
+            not OID.fullmatch(expected_old) or expected_old == sha):
+        raise ValueError('invalid expected old sha')
     ref = 'refs/heads/' + branch
 
     def main():
@@ -53,8 +57,8 @@ def create_once(target, sha, branch, base, *, call, guard, clock=time.monotonic)
 
     if main() != base:
         raise ValueError('main drift')
-    if observe() is not None:
-        raise ValueError('branch exists')
+    if observe() != expected_old:
+        raise ValueError('branch exists or expected head drift')
     # Last remote main observation precedes the final live guard. No network
     # lookup or await intervenes between its one-use permit and the push call.
     started = clock()
@@ -65,9 +69,16 @@ def create_once(target, sha, branch, base, *, call, guard, clock=time.monotonic)
     if not 0 <= clock() - started <= 10.0:
         raise ValueError('main preflight expired')
     try:
-        response = call('create', ref, sha)
+        response = call('create', ref, sha) if expected_old is None else call('update', ref, sha, expected_old)
         expected = (b'To ' + target.remote.encode('ascii') + b'\n*\t' + sha.encode('ascii') +
                     b':' + ref.encode('ascii') + b'\t[new branch]\nDone\n')
+        if expected_old is not None:
+            prefix = b'To ' + target.remote.encode('ascii') + b'\n \t' + sha.encode('ascii') + b':' + ref.encode('ascii') + b'\t'
+            suffix = response[len(prefix):] if type(response) is bytes and response.startswith(prefix) else b''
+            match = re.fullmatch(rb'([0-9a-f]{7,40})\.\.([0-9a-f]{7,40})\nDone\n', suffix)
+            if not match or not expected_old.startswith(match[1].decode()) or not sha.startswith(match[2].decode()):
+                raise ValueError('unacknowledged fast forward')
+            expected = response
         if response != expected or observe() != sha:
             raise ValueError('unacknowledged create')
         observed_main = main()
@@ -82,7 +93,7 @@ def main():
     protocol.isolation.require_worker_isolation()
     protocol.write({'ready': 'transport', 'mapping': 'rootless-owner'})
     body = protocol.read()
-    if type(body) is not dict or set(body) != {'repository', 'sha', 'branch', 'base', 'token'}:
+    if type(body) is not dict or set(body) not in ({'repository', 'sha', 'branch', 'base', 'token'}, {'repository', 'sha', 'branch', 'base', 'token', 'expected_old'}):
         raise ValueError('invalid transport input')
     if (type(body['token']) is not str or not 1 <= len(body['token']) <= 4096 or
             any(ord(c) < 33 or ord(c) > 126 for c in body['token'])):
@@ -90,14 +101,14 @@ def main():
     owner, name = body['repository'].split('/')
     target = git._DeployTarget(owner, name, '/store')
     token = body.pop('token')
-    def call(operation, ref, sha=None):
-        return git._run(target, operation, ref, _pipe(token), sha=sha)
+    def call(operation, ref, sha=None, expected_old=None):
+        return git._run(target, operation, ref, _pipe(token), sha=sha, expected_old=expected_old)
     def guard():
         protocol.write({'guard': 'create'})
         return protocol.read() == {'allow': 'create'}
     try:
         result = create_once(target, body['sha'], body['branch'], body['base'],
-                             call=call, guard=guard)
+                             call=call, guard=guard, expected_old=body.get('expected_old'))
         protocol.write({'result': result})
     except UncertainPush:
         protocol.write({'uncertain': True})

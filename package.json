@@ -41,7 +41,11 @@
     "broker/transport/git_adapter.py",
     "broker/transport/one_shot.py",
     "broker/transport/askpass.py",
-    "broker/transport/production.py"
+    "broker/transport/production.py",
+    "broker/host/namespace_ledger.py",
+    "broker/host/github_workflow.py",
+    "broker/issuer/api_lease.py",
+    "broker/issuer/api_readiness.py"
   ],
   "scripts": {
     "test": "node --test",
