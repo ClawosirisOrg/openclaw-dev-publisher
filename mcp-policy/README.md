@@ -98,7 +98,14 @@ has a 30-second timeout. A stream `write(false)` means that the frame was
 accepted into a bounded buffer: the proxy waits for `drain` **without sending
 it again**. Client responses are serialized while the output is blocked; a
 child stdin or client stdout error, close, or drain timeout aborts fail-closed.
-Child failure/cancel/timeout produces a sanitized error and process cleanup.
+A cancellation naming an already successfully emitted initialize, ping,
+tools/list, or allowlisted read response (including an SDK late abort) is
+ignored. Those safe IDs are retained within the existing 65536 caller-ID cap;
+ID type and the 256-byte UTF-8 bound still apply. Cancellation during output
+drain, or naming an in-flight, queued, unknown, rejected, malformed, or write
+request, aborts the child fail-closed. A cancellation may carry only a valid
+requestId and an optional string reason of at most 256 UTF-8 bytes. Child
+failure/cancel/timeout produces a sanitized error and process cleanup.
 The proxy does not automatically retry either issue or comment writes. A lost
 response **after** dispatch is uncertain and requires independent owner
 reconciliation, not another call. This proxy has no durable cross-session

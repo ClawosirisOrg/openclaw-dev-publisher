@@ -30,6 +30,7 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line =
   if (frame.method === 'ping') return reply(frame.id, {});
   if (frame.method === 'tools/list') {
     const tools = [...names, 'merge_pull_request', 'delete_file'].map(name => ({ name,
+      inputSchema: { type: 'object', properties: {} },
       annotations: { readOnlyHint: !['issue_write', 'add_issue_comment', 'merge_pull_request', 'delete_file'].includes(name) },
       _meta: name === 'issue_write' ? { ui: { resourceUri: 'ui://untrusted-form' } } : {} }));
     if (scenario === 'big-catalog') for (const tool of tools) tool.description = 'x'.repeat(3000);

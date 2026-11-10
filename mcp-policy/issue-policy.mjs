@@ -171,7 +171,8 @@ export class PolicyAdapter {
     this.config = config; this.child = child; this.emit = emit; this.timeout = timeout;
     this.buffer = Buffer.alloc(0); this.pending = null; this.draining = false; this.serial = Promise.resolve(); this.seq = 0;
     this.outputSerial = Promise.resolve(); this.outputQueued = 0;
-    this.usedClientIds = new Set(); this.claimedIds = new Set(); this.queued = 0; this.list = null; this.failed = false; this.initialized = false;
+    this.usedClientIds = new Set(); this.claimedIds = new Set(); this.settledSafeIds = new Set();
+    this.queued = 0; this.list = null; this.failed = false; this.initialized = false;
     child.stdout.on('data', chunk => this.onChildData(chunk));
     child.stdout.on('end', () => this.abort());
     child.on('error', () => this.abort());
@@ -186,12 +187,22 @@ export class PolicyAdapter {
   }
   send(frame) {
     if (++this.outputQueued > MAX_QUEUED) {
-      this.outputQueued--; this.abort(); return Promise.resolve();
+      this.outputQueued--; this.abort(); return Promise.resolve(false);
     }
-    const done = this.outputSerial.then(() => this.emit(frame))
-      .catch(() => this.abort()).finally(() => { this.outputQueued--; });
+    const done = this.outputSerial.then(() => Promise.resolve(this.emit(frame)).then(() => !this.failed))
+      .catch(() => { this.abort(); return false; }).finally(() => { this.outputQueued--; });
     this.outputSerial = done;
     return done;
+  }
+  async sendSafe(id, result) {
+    if (await this.send({ jsonrpc: '2.0', id, result }) && !this.failed) {
+      const key = typeof id + ':' + String(id);
+      // Only IDs admitted through accept() may extend the bounded set.
+      if (this.claimedIds.has(key)) {
+        if (this.settledSafeIds.size >= MAX_CLIENT_IDS) this.abort();
+        else this.settledSafeIds.add(key);
+      }
+    }
   }
   onChildData(chunk) {
     if (this.failed) return;
@@ -271,15 +282,15 @@ export class PolicyAdapter {
         if (!plain(response.result) || !plain(response.result.capabilities) ||
             !plain(response.result.capabilities.tools)) throw fail();
         this.initialized = true;
-        await this.send({ jsonrpc: '2.0', id, result: { ...response.result, capabilities: { tools: {} } } });
+        await this.sendSafe(id, { ...response.result, capabilities: { tools: {} } });
       } else if (!this.initialized) throw fail();
       else if (frame.method === 'ping') {
         const response = await this.call('ping', {});
         if (own(response, 'error')) throw fail();
-        await this.send({ jsonrpc: '2.0', id, result: response.result });
+        await this.sendSafe(id, response.result);
       } else if (frame.method === 'tools/list') {
         if (frame.params !== undefined && (!plain(frame.params) || Object.keys(frame.params).length)) throw fail();
-        await this.send({ jsonrpc: '2.0', id, result: await this.inventory() });
+        await this.sendSafe(id, await this.inventory());
       } else if (frame.method === 'tools/call') {
         if (!plain(frame.params) || Object.keys(frame.params).sort().join(',') !== 'arguments,name' ||
             typeof frame.params.name !== 'string' || !plain(frame.params.arguments)) throw fail();
@@ -307,7 +318,7 @@ export class PolicyAdapter {
         } else {
           const response = await this.call('tools/call', frame.params);
           if (own(response, 'error')) throw fail();
-          await this.send({ jsonrpc: '2.0', id, result: response.result });
+          await this.sendSafe(id, response.result);
         }
       } else throw fail();
     } catch { await this.send(rpcError(id)); if (this.failed) this.abort(); }
@@ -322,7 +333,18 @@ export class PolicyAdapter {
       return;
     }
     if (plain(frame) && frame.jsonrpc === '2.0' && !own(frame, 'id') &&
-        frame.method === 'notifications/cancelled') { this.abort(); return; }
+        frame.method === 'notifications/cancelled') {
+      const params = frame.params;
+      // A late SDK abort of a completed safe response is not cancellation of
+      // an in-flight operation. Unknown, queued, write or undrained IDs abort.
+      if (!plain(params) || !own(params, 'requestId') || !validClientId(params.requestId) ||
+          Object.keys(params).some(k => !['requestId', 'reason'].includes(k)) ||
+          (own(params, 'reason') && (typeof params.reason !== 'string' ||
+            Buffer.byteLength(params.reason, 'utf8') > MAX_CLIENT_ID_BYTES)) ||
+          !this.settledSafeIds.has(typeof params.requestId + ':' + String(params.requestId)))
+        this.abort();
+      return;
+    }
     if (plain(frame) && own(frame, 'id')) {
       const key = typeof frame.id + ':' + String(frame.id);
       if (this.claimedIds.has(key)) { this.abort(); return; }

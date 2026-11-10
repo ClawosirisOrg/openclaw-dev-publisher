@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -531,3 +531,150 @@ for (const failure of ['timeout', 'close', 'error']) {
     assert.equal(readFileSync(log, 'utf8'), '');
   });
 }
+
+const cancel = (f, requestId, extra = {}) => f.adapter.accept({
+  jsonrpc: '2.0', method: 'notifications/cancelled',
+  params: { requestId, ...extra },
+});
+
+test('late cancellation after completed safe discovery and read does not poison next read', async t => {
+  const f = fixture(t); await ready(f);
+  const list = (await f.send(1, 'tools/list')).result.tools;
+  assert.equal(list.length, 20);
+  cancel(f, 1, { reason: 'fixture-abort-after-result' });
+  assert.equal(f.adapter.failed, false);
+  assert.deepEqual((await f.send(2, 'ping')).result, {});
+  cancel(f, 2);
+  assert.equal((await f.send(3, 'tools/call', call('issue_read',
+    { method: 'get', owner: 'Fixture', repo: 'Repo', issue_number: 6 }))).result.content[0].type, 'text');
+  cancel(f, 3);
+  assert.equal((await f.send(4, 'tools/call', call('read_fixture_0', {}))).result.content[0].text, 'read-through fixture');
+  cancel(f, 4);
+  cancel(f, 0); // initialize also completed safely
+  assert.equal(f.adapter.failed, false);
+  assert.deepEqual((await f.send(5, 'ping')).result, {});
+  assert.deepEqual(f.seen().map(x => x.name), ['issue_read', 'read_fixture_0']);
+});
+
+for (const type of ['number', 'string']) {
+  test('late safe cancellation preserves caller ID ' + type + ' and does not change duplicate-ID guard', async t => {
+    const f = fixture(t); await ready(f);
+    const id = type === 'string' ? 'é'.repeat(128) : 7;
+    assert.equal((await f.send(id, 'tools/list')).result.tools.length, 20);
+    cancel(f, type === 'string' ? 7 : '7'); // wrong ID type has no authority
+    assert.equal(f.adapter.failed, true);
+  });
+}
+
+test('completed write ID is never eligible for late safe cancellation', async t => {
+  const f = fixture(t); await ready(f);
+  assert.equal((await f.send(1, 'tools/call', call('issue_write', args('create')))).result.content[0].text,
+    'offline issue write fixture');
+  cancel(f, 1);
+  assert.equal(f.adapter.failed, true);
+  assert.deepEqual(f.seen().map(x => x.name), ['issue_write']);
+});
+
+test('queued write cancellation aborts even when another safe response has settled', async t => {
+  const f = fixture(t, 'timeout', 100); await ready(f);
+  f.adapter.accept({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: call('issue_write', args()) });
+  await wait(() => f.seen().length === 1);
+  f.adapter.accept({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: call('issue_write', args('create')) });
+  cancel(f, 2);
+  assert.equal(f.adapter.failed, true);
+  assert.deepEqual(f.seen().map(x => x.name), ['issue_read']);
+});
+
+for (const params of [undefined, {}, { requestId: null }, { requestId: 1.5 },
+  { requestId: 'x'.repeat(257) }, { requestId: 1, reason: 1 },
+  { requestId: 1, reason: 'x'.repeat(257) }, { requestId: 1, extra: 2 }]) {
+  test('malformed cancellation aborts despite settled safe ID: ' + JSON.stringify(params), async t => {
+    const f = fixture(t); await ready(f);
+    assert.equal((await f.send(1, 'tools/list')).result.tools.length, 20);
+    f.adapter.accept({ jsonrpc: '2.0', method: 'notifications/cancelled', params });
+    assert.equal(f.adapter.failed, true);
+  });
+}
+
+test('rejected request is not marked safe merely because a sanitized error was sent', async t => {
+  const f = fixture(t); await ready(f);
+  assert.equal((await f.send(1, 'tools/call', call('merge_pull_request', {}))).error.message, ERROR);
+  cancel(f, 1);
+  assert.equal(f.adapter.failed, true);
+});
+
+test('a response queued behind a blocked output cannot authorize its cancellation', async t => {
+  const f = fixture(t); await ready(f);
+  let release;
+  f.adapter.emit = frame => frame.id === 1 ? new Promise(resolve => { release = resolve; }) : f.out.push(frame);
+  f.adapter.accept({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+  await wait(() => release);
+  assert.equal(f.adapter.settledSafeIds.has('number:1'), false);
+  cancel(f, 1);
+  assert.equal(f.adapter.failed, true);
+  release();
+  await wait(() => f.adapter.queued === 0);
+  assert.equal(f.adapter.settledSafeIds.has('number:1'), false);
+});
+
+test('settled IDs remain bounded by existing claimed ID cap', async t => {
+  const f = fixture(t); await ready(f);
+  assert.equal((await f.send(1, 'tools/list')).result.tools.length, 20);
+  assert.ok(f.adapter.settledSafeIds.size <= f.adapter.claimedIds.size);
+  f.adapter.accept({ jsonrpc: '2.0', id: 1, method: 'ping', params: {} });
+  assert.equal(f.adapter.failed, true);
+});
+
+test('installed SDK abort of completed tools/list leaves next issue_read available offline', {
+  skip: !existsSync('/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js'),
+}, async t => {
+  const { Client } = await import('/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js');
+  const { StdioClientTransport } = await import('/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js');
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-sdk-late-cancel-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const binary = join(dir, 'stock'); copyFileSync(source, binary); chmodSync(binary, 0o700);
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify({ binary, binary_sha256: createHash('sha256').update(readFileSync(binary)).digest('hex'),
+    repository: 'Fixture/Repo', read_tools: READ }), { mode: 0o600 });
+  const log = join(dir, 'events'); writeFileSync(log, '');
+  const client = new Client({ name: 'fixture-sdk', version: '0' }, { capabilities: {} });
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: [fileURLToPath(new URL('../mcp-policy/issue-policy.mjs', import.meta.url)), '--config', file],
+    env: { ...process.env, FAKE_LOG: log, FAKE_SCENARIO: 'issue' } });
+  const originalSend = transport.send.bind(transport); let cancellations = 0;
+  transport.send = async frame => {
+    if (frame.method === 'notifications/cancelled') cancellations++;
+    return originalSend(frame);
+  };
+  t.after(async () => { await client.close(); });
+  await client.connect(transport);
+  const controller = new AbortController();
+  assert.equal((await client.listTools({}, { signal: controller.signal })).tools.length, 20);
+  controller.abort();
+  await wait(() => cancellations === 1);
+  const result = await client.callTool({ name: 'issue_read', arguments: {
+    method: 'get', owner: 'Fixture', repo: 'Repo', issue_number: 6,
+  } });
+  assert.equal(result.content[0].type, 'text');
+  assert.deepEqual(readFileSync(log, 'utf8').trim().split(String.fromCharCode(10)).map(x => JSON.parse(x).name), ['issue_read']);
+});
+
+test('exact 256 UTF-8 byte safe caller ID is eligible for late cancellation', async t => {
+  const f = fixture(t); await ready(f);
+  const id = 'é'.repeat(128);
+  assert.equal((await f.send(id, 'tools/list')).result.tools.length, 20);
+  cancel(f, id);
+  assert.equal(f.adapter.failed, false);
+  assert.deepEqual((await f.send(1, 'ping')).result, {});
+});
+
+test('active read cancellation still aborts despite earlier settled catalog', async t => {
+  const f = fixture(t, 'timeout', 100); await ready(f);
+  assert.equal((await f.send(1, 'tools/list')).result.tools.length, 20);
+  f.adapter.accept({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: call('issue_read',
+    { method: 'get', owner: 'Fixture', repo: 'Repo', issue_number: 6 }) });
+  await wait(() => f.seen().some(x => x.name === 'issue_read'));
+  cancel(f, 2);
+  assert.equal(f.adapter.failed, true);
+  assert.deepEqual(f.seen().map(x => x.name), ['issue_read']);
+});
