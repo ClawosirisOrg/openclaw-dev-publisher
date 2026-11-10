@@ -1,13 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { PassThrough } from 'node:stream';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { PolicyAdapter, loadConfig, provenIssue, issueWriteArgs } from '../mcp-policy/issue-policy.mjs';
+import { PolicyAdapter, loadConfig, provenIssue, issueWriteArgs, start } from '../mcp-policy/issue-policy.mjs';
 
 const source = fileURLToPath(new URL('../mcp-policy/fixtures/stock-mcp-fake.mjs', import.meta.url));
 const READ = ['issue_read', ...Array.from({ length: 17 }, (_, i) => 'read_fixture_' + i)];
@@ -386,3 +387,147 @@ test('direct request entrypoint accepts exact 256-byte ASCII and multibyte IDs',
     assert.deepEqual(f.out[before], { jsonrpc: '2.0', id, result: {} });
   }
 });
+
+test('two queued large catalogs drain once each and leave ping/read available', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-slow-catalog-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const log = join(dir, 'events'); writeFileSync(log, '');
+  const child = spawn(process.execPath, [source, 'stdio', '--tools',
+    [...READ, 'issue_write', 'add_issue_comment'].join(',')], {
+    stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, FAKE_LOG: log, FAKE_SCENARIO: 'big-catalog' },
+  });
+  t.after(() => child.kill('SIGKILL'));
+  const stdin = new PassThrough();
+  const stdout = new PassThrough({ highWaterMark: 1 });
+  const frames = []; let buffer = '';
+  stdout.on('data', chunk => {
+    buffer += chunk.toString('utf8');
+    for (;;) {
+      const index = buffer.indexOf(String.fromCharCode(10)); if (index < 0) break;
+      frames.push(JSON.parse(buffer.slice(0, index))); buffer = buffer.slice(index + 1);
+    }
+  });
+  const adapter = start(config, stdin, stdout, () => child, 500);
+  const send = (id, method, params = {}) => {
+    stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + String.fromCharCode(10));
+    return wait(() => frames.find(f => f.id === id));
+  };
+  assert.equal((await send(1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {},
+    clientInfo: { name: 'fixture', version: '0' } })).result.serverInfo.name, 'fixture');
+  stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + String.fromCharCode(10));
+  stdout.pause();
+  const first = send(2, 'tools/list');
+  const second = send(3, 'tools/list');
+  await wait(() => stdout.writableNeedDrain);
+  assert.equal(adapter.failed, false);
+  assert.equal(frames.some(f => f.id === 3), false);
+  stdout.resume();
+  const listA = (await first).result.tools;
+  const listB = (await second).result.tools;
+  assert.equal(listA.length, 20); assert.equal(listB.length, 20);
+  assert.ok(JSON.stringify({ tools: listA }).length > 60000);
+  assert.deepEqual(listA.map(t => t.name), listB.map(t => t.name));
+  assert.deepEqual((await send(4, 'ping')).result, {});
+  assert.equal((await send(5, 'tools/call', call('issue_read',
+    { method: 'get', owner: 'Fixture', repo: 'Repo', issue_number: 6 }))).result.content[0].type, 'text');
+  assert.equal(adapter.failed, false);
+  assert.deepEqual(readFileSync(log, 'utf8').trim().split(String.fromCharCode(10)).map(x => JSON.parse(x).name), ['issue_read']);
+});
+
+test('child stdin write(false) drains without dispatching issue create twice', async t => {
+  const f = fixture(t); await ready(f);
+  await f.send(1, 'tools/list'); // inventory cached before injected backpressure
+  const original = f.child.stdin.write.bind(f.child.stdin);
+  const dispatched = [];
+  f.child.stdin.write = function (payload) {
+    dispatched.push(JSON.parse(payload));
+    original(payload);
+    queueMicrotask(() => this.emit('drain'));
+    return false;
+  };
+  assert.equal((await f.send(2, 'tools/call', call('issue_write', args('create'))))
+    .result.content[0].text, 'offline issue write fixture');
+  assert.equal(dispatched.filter(x => x.params?.name === 'issue_write').length, 1);
+  assert.deepEqual(f.seen().map(x => x.name), ['issue_write']);
+  assert.equal(f.adapter.failed, false);
+  assert.deepEqual((await f.send(3, 'ping')).result, {});
+});
+
+for (const failure of ['timeout', 'close', 'error']) {
+  test('child stdin false then ' + failure + ' fails closed without retrying a write', async t => {
+    const f = fixture(t, 'issue', 70); await ready(f); await f.send(1, 'tools/list');
+    const original = f.child.stdin.write.bind(f.child.stdin);
+    let dispatches = 0;
+    f.child.stdin.write = function (payload) {
+      dispatches++;
+      original(payload);
+      if (failure === 'close') queueMicrotask(() => this.emit('close'));
+      if (failure === 'error') queueMicrotask(() => this.emit('error', new Error('fixture-stream-error')));
+      return false;
+    };
+    assert.equal((await f.send(2, 'tools/call', call('issue_write', args('create')))).error.message, ERROR);
+    assert.equal(f.adapter.failed, true);
+    assert.equal(dispatches, 1);
+    assert.ok(f.seen().length <= 1); // error may close the child before it handles the queued bytes
+    assert.ok(f.seen().every(x => x.name === 'issue_write'));
+    assert.equal((await f.send(3, 'tools/call', call('issue_write', args('create')))).error.message, ERROR);
+    assert.equal(dispatches, 1);
+  });
+}
+
+test('initialized notification false-then-drain is sent once and does not kill child', async t => {
+  const f = fixture(t); await ready(f);
+  await wait(() => f.adapter.queued === 0);
+  const original = f.child.stdin.write.bind(f.child.stdin);
+  let count = 0;
+  f.child.stdin.write = function (payload) {
+    if (JSON.parse(payload).method === 'notifications/initialized') count++;
+    original(payload);
+    queueMicrotask(() => this.emit('drain'));
+    return false;
+  };
+  f.adapter.accept({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  await wait(() => f.adapter.queued === 0);
+  assert.equal(count, 1);
+  assert.equal(f.adapter.failed, false);
+  assert.deepEqual((await f.send(1, 'ping')).result, {});
+});
+
+for (const failure of ['timeout', 'close', 'error']) {
+  test('blocked stdout ' + failure + ' fails closed without retries or unbounded output', async t => {
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-blocked-output-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const log = join(dir, 'events'); writeFileSync(log, '');
+    const child = spawn(process.execPath, [source, 'stdio', '--tools',
+      [...READ, 'issue_write', 'add_issue_comment'].join(',')], {
+      stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, FAKE_LOG: log, FAKE_SCENARIO: 'big-catalog' },
+    });
+    t.after(() => child.kill('SIGKILL'));
+    const stdin = new PassThrough();
+    const stdout = new PassThrough({ highWaterMark: 1 });
+    t.after(() => stdout.destroy());
+    const frames = []; let buffer = '';
+    stdout.on('data', chunk => {
+      buffer += chunk.toString('utf8');
+      for (;;) {
+        const index = buffer.indexOf(String.fromCharCode(10)); if (index < 0) break;
+        frames.push(JSON.parse(buffer.slice(0, index))); buffer = buffer.slice(index + 1);
+      }
+    });
+    const adapter = start(config, stdin, stdout, () => child, 80);
+    stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {},
+        clientInfo: { name: 'fixture', version: '0' } } }) + String.fromCharCode(10));
+    await wait(() => frames.some(x => x.id === 1));
+    stdout.pause();
+    stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + String.fromCharCode(10));
+    await wait(() => stdout.writableNeedDrain);
+    if (failure === 'close') stdout.destroy();
+    if (failure === 'error') stdout.destroy(new Error('fixture-output-error'));
+    await wait(() => adapter.failed);
+    assert.ok(adapter.outputQueued <= 1);
+    assert.ok(adapter.queued <= 1);
+    assert.equal(adapter.seq, 2); // initialize + one stock inventory; no replay
+    assert.equal(readFileSync(log, 'utf8'), '');
+  });
+}

@@ -94,11 +94,15 @@ size is bounded to 1 MiB, the pending queue to 128 calls, retained caller
 IDs to 65536, and each caller string ID to **256 UTF-8 bytes**. IDs beyond
 that bound (or invalid numeric IDs) abort without reflecting the ID or sending
 a child request; safe-integer numeric IDs remain supported. Each child request
-has a 30-second timeout, and child failure/cancel/timeout produces a sanitized error and process cleanup. It does
-not automatically retry either issue or comment writes. A lost response
-**after** dispatch is uncertain and requires independent owner reconciliation,
-not another call. This proxy
-has no durable cross-session operation ledger and does not claim exactly-once
+has a 30-second timeout. A stream `write(false)` means that the frame was
+accepted into a bounded buffer: the proxy waits for `drain` **without sending
+it again**. Client responses are serialized while the output is blocked; a
+child stdin or client stdout error, close, or drain timeout aborts fail-closed.
+Child failure/cancel/timeout produces a sanitized error and process cleanup.
+The proxy does not automatically retry either issue or comment writes. A lost
+response **after** dispatch is uncertain and requires independent owner
+reconciliation, not another call. This proxy has no durable cross-session
+operation ledger and does not claim exactly-once
 remote effects, atomic preflight/write or resistance to a separately privileged
 writer. Credential attenuation and actual App grants are separate host checks.
 

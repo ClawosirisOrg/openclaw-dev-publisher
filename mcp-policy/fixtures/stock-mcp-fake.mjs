@@ -32,6 +32,7 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line =
     const tools = [...names, 'merge_pull_request', 'delete_file'].map(name => ({ name,
       annotations: { readOnlyHint: !['issue_write', 'add_issue_comment', 'merge_pull_request', 'delete_file'].includes(name) },
       _meta: name === 'issue_write' ? { ui: { resourceUri: 'ui://untrusted-form' } } : {} }));
+    if (scenario === 'big-catalog') for (const tool of tools) tool.description = 'x'.repeat(3000);
     if (scenario === 'untrusted-read') tools.find(x => x.name === 'issue_read').annotations.readOnlyHint = false;
     if (scenario === 'missing-read') tools.splice(tools.findIndex(x => x.name === 'issue_read'), 1);
     return reply(frame.id, { tools });

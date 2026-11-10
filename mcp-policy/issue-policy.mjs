@@ -151,10 +151,26 @@ function rpcError(id, code = -32000) {
   return { jsonrpc: '2.0', id, error: { code, message: 'mcp_policy_denied_or_uncertain' } };
 }
 
+// write(false) means accepted into the stream's buffer, not rejected. Never resend.
+function awaitDrain(stream, timeout) {
+  if (typeof stream.once !== 'function' || typeof stream.off !== 'function') return Promise.reject(fail());
+  return new Promise((resolve, reject) => {
+    const clear = () => {
+      clearTimeout(timer);
+      stream.off('drain', drained); stream.off('error', failed); stream.off('close', failed);
+    };
+    const drained = () => { clear(); resolve(); };
+    const failed = () => { clear(); reject(fail()); };
+    const timer = setTimeout(failed, timeout);
+    stream.once('drain', drained); stream.once('error', failed); stream.once('close', failed);
+  });
+}
+
 export class PolicyAdapter {
   constructor(config, child, emit, timeout = TIMEOUT) {
     this.config = config; this.child = child; this.emit = emit; this.timeout = timeout;
-    this.buffer = Buffer.alloc(0); this.pending = null; this.serial = Promise.resolve(); this.seq = 0;
+    this.buffer = Buffer.alloc(0); this.pending = null; this.draining = false; this.serial = Promise.resolve(); this.seq = 0;
+    this.outputSerial = Promise.resolve(); this.outputQueued = 0;
     this.usedClientIds = new Set(); this.claimedIds = new Set(); this.queued = 0; this.list = null; this.failed = false; this.initialized = false;
     child.stdout.on('data', chunk => this.onChildData(chunk));
     child.stdout.on('end', () => this.abort());
@@ -167,6 +183,15 @@ export class PolicyAdapter {
     this.failed = true; this.buffer = Buffer.alloc(0);
     this.child.kill('SIGKILL');
     if (this.pending) { clearTimeout(this.pending.timer); this.pending.reject(fail()); this.pending = null; }
+  }
+  send(frame) {
+    if (++this.outputQueued > MAX_QUEUED) {
+      this.outputQueued--; this.abort(); return Promise.resolve();
+    }
+    const done = this.outputSerial.then(() => this.emit(frame))
+      .catch(() => this.abort()).finally(() => { this.outputQueued--; });
+    this.outputSerial = done;
+    return done;
   }
   onChildData(chunk) {
     if (this.failed) return;
@@ -187,19 +212,24 @@ export class PolicyAdapter {
     }
   }
   call(method, params) {
-    if (this.failed || this.pending) return Promise.reject(fail());
+    if (this.failed || this.pending || this.draining) return Promise.reject(fail());
     const id = 'policy-' + (++this.seq);
-    return new Promise((resolve, reject) => {
+    let drain;
+    const response = new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.abort(); }, this.timeout);
       this.pending = { id, resolve, reject, timer };
       const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params });
       try {
-        if (Buffer.byteLength(payload) > MAX_LINE || !this.child.stdin.write(payload + '\n')) {
-          // Backpressure is not an acknowledgement; abort rather than queue writes.
-          this.abort();
+        if (Buffer.byteLength(payload) > MAX_LINE) { this.abort(); return; }
+        if (!this.child.stdin.write(payload + '\n')) {
+          this.draining = true;
+          drain = awaitDrain(this.child.stdin, this.timeout)
+            .catch(() => { this.abort(); throw fail(); })
+            .finally(() => { this.draining = false; });
         }
       } catch { this.abort(); }
     });
+    return drain ? Promise.all([response, drain]).then(([result]) => result) : response;
   }
   async inventory() {
     if (this.list) return this.list;
@@ -229,7 +259,7 @@ export class PolicyAdapter {
     if (!plain(frame) || frame.jsonrpc !== '2.0' || !own(frame, 'id') ||
         !validClientId(frame.id)) { this.abort(); return; }
     const key = typeof frame.id + ':' + String(frame.id);
-    if (this.usedClientIds.has(key)) { this.abort(); this.emit(rpcError(frame.id)); return; }
+    if (this.usedClientIds.has(key)) { this.abort(); await this.send(rpcError(frame.id)); return; }
     this.usedClientIds.add(key);
     const id = frame.id;
     try {
@@ -241,15 +271,15 @@ export class PolicyAdapter {
         if (!plain(response.result) || !plain(response.result.capabilities) ||
             !plain(response.result.capabilities.tools)) throw fail();
         this.initialized = true;
-        this.emit({ jsonrpc: '2.0', id, result: { ...response.result, capabilities: { tools: {} } } });
+        await this.send({ jsonrpc: '2.0', id, result: { ...response.result, capabilities: { tools: {} } } });
       } else if (!this.initialized) throw fail();
       else if (frame.method === 'ping') {
         const response = await this.call('ping', {});
         if (own(response, 'error')) throw fail();
-        this.emit({ jsonrpc: '2.0', id, result: response.result });
+        await this.send({ jsonrpc: '2.0', id, result: response.result });
       } else if (frame.method === 'tools/list') {
         if (frame.params !== undefined && (!plain(frame.params) || Object.keys(frame.params).length)) throw fail();
-        this.emit({ jsonrpc: '2.0', id, result: await this.inventory() });
+        await this.send({ jsonrpc: '2.0', id, result: await this.inventory() });
       } else if (frame.method === 'tools/call') {
         if (!plain(frame.params) || Object.keys(frame.params).sort().join(',') !== 'arguments,name' ||
             typeof frame.params.name !== 'string' || !plain(frame.params.arguments)) throw fail();
@@ -273,14 +303,14 @@ export class PolicyAdapter {
               response.result.structuredContent?.status === 'awaiting_user_submission') {
             this.abort(); throw fail();
           }
-          this.emit({ jsonrpc: '2.0', id, result: response.result });
+          await this.send({ jsonrpc: '2.0', id, result: response.result });
         } else {
           const response = await this.call('tools/call', frame.params);
           if (own(response, 'error')) throw fail();
-          this.emit({ jsonrpc: '2.0', id, result: response.result });
+          await this.send({ jsonrpc: '2.0', id, result: response.result });
         }
       } else throw fail();
-    } catch { this.emit(rpcError(id)); if (this.failed) this.abort(); }
+    } catch { await this.send(rpcError(id)); if (this.failed) this.abort(); }
   }
   accept(frame) {
     // Reject before key construction, retention, queuing or reflection, even after failure.
@@ -288,7 +318,7 @@ export class PolicyAdapter {
       this.abort(); return;
     }
     if (this.failed) {
-      if (plain(frame) && own(frame, 'id')) this.emit(rpcError(frame.id));
+      if (plain(frame) && own(frame, 'id')) void this.send(rpcError(frame.id));
       return;
     }
     if (plain(frame) && frame.jsonrpc === '2.0' && !own(frame, 'id') &&
@@ -304,20 +334,27 @@ export class PolicyAdapter {
       if (plain(frame) && !own(frame, 'id') && frame.jsonrpc === '2.0' &&
           frame.method === 'notifications/initialized' && this.initialized &&
           (frame.params === undefined || plain(frame.params))) {
-        if (!this.child.stdin.write(JSON.stringify(frame) + '\n')) this.abort();
+        if (!this.child.stdin.write(JSON.stringify(frame) + '\n'))
+          await awaitDrain(this.child.stdin, this.timeout);
       } else await this.request(frame);
     }).catch(() => this.abort()).finally(() => { this.queued--; });
   }
 }
 
-export function start(config, stdin = process.stdin, stdout = process.stdout, launcher = spawn) {
+export function start(config, stdin = process.stdin, stdout = process.stdout, launcher = spawn, timeout = TIMEOUT) {
   const tools = [...config.readTools, 'issue_write', 'add_issue_comment'].join(',');
   const child = launcher(config.binary, ['stdio', '--tools', tools], {
     stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env }, windowsHide: true,
   });
-  const adapter = new PolicyAdapter(config, child, frame => {
-    if (!stdout.write(JSON.stringify(frame) + '\n')) adapter.abort();
-  });
+  let outputFailed = false;
+  const adapter = new PolicyAdapter(config, child, async frame => {
+    if (outputFailed) throw fail();
+    try {
+      if (!stdout.write(JSON.stringify(frame) + '\n')) await awaitDrain(stdout, timeout);
+    } catch { outputFailed = true; throw fail(); }
+  }, timeout);
+  stdout.on?.('error', () => { outputFailed = true; adapter.abort(); });
+  stdout.on?.('close', () => { outputFailed = true; adapter.abort(); });
   let input = Buffer.alloc(0);
   stdin.on('data', chunk => {
     input = Buffer.concat([input, chunk]);
