@@ -23,10 +23,14 @@ function issue(number, owner, repo) {
     content: [{ type: 'text', text: JSON.stringify(result) }] };
   return { content: [{ type: 'text', text: JSON.stringify(result) }] };
 }
+let uiCapable = false;
 createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
   const frame = JSON.parse(line);
   if (frame.method === 'notifications/initialized') return;
-  if (frame.method === 'initialize') return reply(frame.id, { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '0' } });
+  if (frame.method === 'initialize') {
+    uiCapable = Object.hasOwn(frame.params.capabilities?.extensions ?? {}, 'io.modelcontextprotocol/ui');
+    return reply(frame.id, { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '0' } });
+  }
   if (frame.method === 'ping') return reply(frame.id, {});
   if (frame.method === 'tools/list') {
     const tools = [...names, 'merge_pull_request', 'delete_file'].map(name => ({ name,
@@ -62,6 +66,14 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line =
     if (scenario === 'crash-write') process.exit(1);
     if (scenario === 'timeout-write') return;
     if (scenario === 'await-form') return reply(frame.id, { isError: false, structuredContent: { status: 'awaiting_user_submission' } });
+    if (scenario === 'ui-form-gate' && uiCapable)
+      return reply(frame.id, { isError: true, structuredContent: { status: 'awaiting_user_submission' } });
+    if (scenario === 'ui-form-gate') {
+      appendFileSync(process.env.FAKE_EFFECT_LOG, 'synthetic issue write effect\n');
+      const minimal = { id: 'fixture-id', url: 'https://github.com/Fixture/Repo/issues/6' };
+      return reply(frame.id, { isError: false, content: [{ type: 'text', text: JSON.stringify(minimal) }],
+        structuredContent: { method: args.method, issue: minimal } });
+    }
     return reply(frame.id, { content: [{ type: 'text', text: 'offline issue write fixture' }] });
   }
   reply(frame.id, { content: [{ type: 'text', text: 'read-through fixture' }], isError: false });

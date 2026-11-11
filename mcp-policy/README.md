@@ -31,8 +31,15 @@ have stock `annotations.readOnlyHint: true`; stock `issue_write` and
 `add_issue_comment` must each have `readOnlyHint: false`. The proxy starts only
 the pinned child binary with
 `stdio --tools <exact comma-separated 18 reads,issue_write,add_issue_comment>`.
-No `--toolsets` or dynamic tool names. It exposes exactly those 20 tools even if
-the child lists additional tools; calls to anything else are denied.
+No `--toolsets` or dynamic tool names. During child-facing initialize, it
+removes only the `io.modelcontextprotocol/ui` client capability extension
+without mutating the caller's request or other capabilities. The pinned stock
+server otherwise defers `issue_write` to an MCP App form on UI-capable clients;
+that form submission would bypass this adapter's canonical issue preflight.
+The adapter continues denying any awaiting-form result, error, or uncertain
+write and never retries a write. This change does not disable the host's UI
+capability outside this child session. The proxy exposes exactly those 20 tools
+even if the child lists additional tools; calls to anything else are denied.
 
 The JSON file must be a regular owner-only (0600) same-Gateway-UID file outside
 source/workspaces, with non-symlink safe ancestors. The binary must be a regular,

@@ -18,8 +18,9 @@ function fixture(t, scenario = 'issue', timeout = 300) {
   const dir = mkdtempSync(join(tmpdir(), 'mcp-policy-fixture-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const log = join(dir, 'events'); writeFileSync(log, '');
+  const effectLog = join(dir, 'effects'); writeFileSync(effectLog, '');
   const child = spawn(process.execPath, [source, 'stdio', '--tools', [...READ, 'issue_write', 'add_issue_comment'].join(',')], {
-    stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, FAKE_LOG: log, FAKE_SCENARIO: scenario },
+    stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, FAKE_LOG: log, FAKE_EFFECT_LOG: effectLog, FAKE_SCENARIO: scenario },
   });
   t.after(() => child.kill('SIGKILL'));
   const out = [];
@@ -29,7 +30,8 @@ function fixture(t, scenario = 'issue', timeout = 300) {
     adapter.accept({ jsonrpc: '2.0', id, method, params });
     return wait(() => out.find(x => x.id === id));
   };
-  return { adapter, child, out, seen, send };
+  const effects = () => readFileSync(effectLog, 'utf8').trim().split('\n').filter(Boolean);
+  return { adapter, child, out, seen, send, effects };
 }
 async function wait(predicate, timeout = 1200) {
   for (let i = 0; i < timeout / 5; i++) {
@@ -677,4 +679,109 @@ test('active read cancellation still aborts despite earlier settled catalog', as
   cancel(f, 2);
   assert.equal(f.adapter.failed, true);
   assert.deepEqual(f.seen().map(x => x.name), ['issue_read']);
+});
+
+test('child initialize drops only stock MCP App UI extension, preserving caller parameters', async t => {
+  const f = fixture(t, 'ui-form-gate');
+  let forwarded;
+  const write = f.child.stdin.write.bind(f.child.stdin);
+  f.child.stdin.write = function (payload) {
+    const frame = JSON.parse(payload);
+    if (frame.method === 'initialize') forwarded = frame.params;
+    return write(payload);
+  };
+  const params = { protocolVersion: '2025-06-18', clientInfo: { name: 'fixture', version: '0' },
+    capabilities: { elicitation: { form: {}, url: {} }, sampling: { custom: true },
+      extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] },
+        'openai/elicitation': { form: {} }, 'custom.fixture': { keep: true } } },
+    _meta: { custom: 'unchanged' } };
+  const original = structuredClone(params);
+  assert.equal((await f.send(0, 'initialize', params)).result.serverInfo.name, 'fixture');
+  assert.deepEqual(params, original);
+  assert.deepEqual(forwarded, { ...original, capabilities: { ...original.capabilities,
+    extensions: { 'openai/elicitation': { form: {} }, 'custom.fixture': { keep: true } } } });
+  f.adapter.accept({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  assert.equal((await f.send(1, 'tools/call', call('issue_write', args()))).result.structuredContent.issue.url,
+    'https://github.com/Fixture/Repo/issues/6');
+  assert.deepEqual(f.seen().map(x => x.name), ['issue_read', 'issue_write']);
+  assert.equal(f.effects().length, 1);
+  assert.equal(f.adapter.failed, false);
+});
+
+for (const bad of [{ capabilities: null }, { capabilities: [] }, { capabilities: 'ui' },
+  { capabilities: { extensions: null } }, { capabilities: { extensions: [] } },
+  { capabilities: { extensions: 'ui' } }]) {
+  test('malformed child-facing client capability fails closed before stock: ' + JSON.stringify(bad), async t => {
+    const f = fixture(t, 'ui-form-gate');
+    let initializeCalls = 0;
+    const write = f.child.stdin.write.bind(f.child.stdin);
+    f.child.stdin.write = function (payload) {
+      if (JSON.parse(payload).method === 'initialize') initializeCalls++;
+      return write(payload);
+    };
+    assert.equal((await f.send(0, 'initialize', { protocolVersion: '2025-06-18',
+      clientInfo: { name: 'fixture', version: '0' }, ...bad })).error.message, ERROR);
+    assert.equal(initializeCalls, 0);
+    assert.equal(f.effects().length, 0);
+  });
+}
+
+test('UI-capable caller cannot bypass PR preflight or submit a form result', async t => {
+  const pr = fixture(t, 'pr');
+  await pr.send(0, 'initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'fixture', version: '0' },
+    capabilities: { extensions: { 'io.modelcontextprotocol/ui': {} } } });
+  assert.equal((await pr.send(1, 'tools/call', call('issue_write', args()))).error.message, ERROR);
+  assert.deepEqual(pr.seen().map(x => x.name), ['issue_read']);
+  const form = fixture(t, 'await-form');
+  await form.send(0, 'initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'fixture', version: '0' },
+    capabilities: { extensions: { 'io.modelcontextprotocol/ui': {} } } });
+  assert.equal((await form.send(1, 'tools/call', call('issue_write', args('create')))).error.message, ERROR);
+  assert.equal(form.adapter.failed, true);
+});
+
+test('headless issue create still executes once; comment scope remains unchanged', async t => {
+  const f = fixture(t, 'ui-form-gate'); await ready(f);
+  assert.equal((await f.send(1, 'tools/call', call('issue_write', args('create')))).result.structuredContent.issue.url,
+    'https://github.com/Fixture/Repo/issues/6');
+  assert.equal((await f.send(2, 'tools/call', call('add_issue_comment', {
+    owner: 'Fixture', repo: 'Repo', issue_number: 6, body: 'offline comment',
+  }))).result.content[0].text, 'offline comment fixture');
+  assert.deepEqual(f.seen().map(x => x.name), ['issue_write', 'issue_read', 'add_issue_comment']);
+  assert.equal(f.effects().length, 1);
+});
+
+test('installed UI-capable client gets 20 tools and one direct fake update effect', {
+  skip: !existsSync('/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js'),
+}, async t => {
+  const { Client } = await import('/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js');
+  const { StdioClientTransport } = await import('/app/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js');
+  const dir = mkdtempSync(join(tmpdir(), 'mcp-ui-form-gate-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const binary = join(dir, 'stock-fake'); copyFileSync(source, binary); chmodSync(binary, 0o700);
+  const file = join(dir, 'config.json'), log = join(dir, 'events'), effectLog = join(dir, 'effects');
+  writeFileSync(file, JSON.stringify({ binary,
+    binary_sha256: createHash('sha256').update(readFileSync(binary)).digest('hex'),
+    repository: 'Fixture/Repo', read_tools: READ }), { mode: 0o600 });
+  writeFileSync(log, ''); writeFileSync(effectLog, '');
+  const caps = { elicitation: { form: {}, url: {} }, extensions: {
+    'openai/elicitation': { form: {} },
+    'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] },
+  } }; const capsBefore = structuredClone(caps);
+  const client = new Client({ name: 'openclaw-bundle-mcp', version: '0.0.0' }, { capabilities: caps });
+  const env = { ...process.env, FAKE_LOG: log, FAKE_EFFECT_LOG: effectLog, FAKE_SCENARIO: 'ui-form-gate' };
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_PERSONAL_ACCESS_TOKEN',
+    'GITHUB_APP_ID', 'GITHUB_APP_INSTALLATION_ID', 'GITHUB_APP_PRIVATE_KEY_PATH']) delete env[key];
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: [fileURLToPath(new URL('../mcp-policy/issue-policy.mjs', import.meta.url)), '--config', file], env });
+  t.after(async () => { await client.close(); });
+  await client.connect(transport);
+  assert.equal((await client.listTools()).tools.length, 20);
+  const result = await client.callTool({ name: 'issue_write', arguments: args() });
+  assert.deepEqual(JSON.parse(result.content[0].text),
+    { id: 'fixture-id', url: 'https://github.com/Fixture/Repo/issues/6' });
+  assert.equal(result.structuredContent.method, 'update');
+  assert.equal(readFileSync(effectLog, 'utf8').trim().split(String.fromCharCode(10)).length, 1);
+  assert.deepEqual(readFileSync(log, 'utf8').trim().split(String.fromCharCode(10)).map(x => JSON.parse(x).name),
+    ['issue_read', 'issue_write']);
+  assert.deepEqual(caps, capsBefore);
 });

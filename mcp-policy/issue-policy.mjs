@@ -277,7 +277,18 @@ export class PolicyAdapter {
       if (this.failed) throw fail();
       if (frame.method === 'initialize') {
         if (this.initialized || !plain(frame.params)) throw fail();
-        const response = await this.call('initialize', frame.params);
+        const capabilities = frame.params.capabilities;
+        if (capabilities !== undefined && !plain(capabilities)) throw fail();
+        const extensions = capabilities?.extensions;
+        if (extensions !== undefined && !plain(extensions)) throw fail();
+        // The stock issue form defers a write when this UI extension reaches
+        // the child. We do not expose its unguarded form submission path.
+        const childParams = extensions && own(extensions, 'io.modelcontextprotocol/ui')
+          ? { ...frame.params, capabilities: { ...capabilities, extensions: Object.fromEntries(
+            Object.entries(extensions).filter(([key]) => key !== 'io.modelcontextprotocol/ui'),
+          ) } }
+          : frame.params;
+        const response = await this.call('initialize', childParams);
         if (own(response, 'error')) throw fail();
         if (!plain(response.result) || !plain(response.result.capabilities) ||
             !plain(response.result.capabilities.tools)) throw fail();
