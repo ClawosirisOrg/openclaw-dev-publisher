@@ -9,22 +9,29 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PolicyAdapter, loadConfig, provenIssue, issueWriteArgs, start } from '../mcp-policy/issue-policy.mjs';
+import { expandGroups, WRITE_TOOLS, safeRead, goodAttribution, projectTool, WRITE_CONTRACT } from '../mcp-policy/syn-tool-policy.mjs';
+import { admitWrite } from '../mcp-policy/syn-write-policy.mjs';
 
 const source = fileURLToPath(new URL('../mcp-policy/fixtures/stock-mcp-fake.mjs', import.meta.url));
 const READ = ['issue_read', ...Array.from({ length: 17 }, (_, i) => 'read_fixture_' + i)];
 const config = Object.freeze({ binary: source, owner: 'Fixture', repo: 'Repo', readTools: READ });
+const v2tools = expandGroups(['issues','pull_requests','actions','repository','releases']);
+const v2config = Object.freeze({ binary: source, owner:'Fixture', repo:'Repo', version:2,
+  tools:v2tools, readTools:v2tools.filter(n => !WRITE_TOOLS.has(n)) });
+const attributed = 'Offline only\n\nAgent: dev-syn\nModel: openai/gpt-6-sol\nThinking: high\nBot-Owner: @llunved';
 const ERROR = 'mcp_policy_denied_or_uncertain';
-function fixture(t, scenario = 'issue', timeout = 300) {
+function fixture(t, scenario = 'issue', timeout = 300, policy = config) {
   const dir = mkdtempSync(join(tmpdir(), 'mcp-policy-fixture-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const log = join(dir, 'events'); writeFileSync(log, '');
   const effectLog = join(dir, 'effects'); writeFileSync(effectLog, '');
-  const child = spawn(process.execPath, [source, 'stdio', '--tools', [...READ, 'issue_write', 'add_issue_comment'].join(',')], {
+  const child = spawn(process.execPath, [source, 'stdio', '--tools',
+    (policy.tools ?? [...READ, 'issue_write', 'add_issue_comment']).join(',')], {
     stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, FAKE_LOG: log, FAKE_EFFECT_LOG: effectLog, FAKE_SCENARIO: scenario },
   });
   t.after(() => child.kill('SIGKILL'));
   const out = [];
-  const adapter = new PolicyAdapter(config, child, frame => out.push(frame), timeout);
+  const adapter = new PolicyAdapter(policy, child, frame => out.push(frame), timeout);
   const seen = () => readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(x => JSON.parse(x));
   const send = (id, method, params = {}) => {
     adapter.accept({ jsonrpc: '2.0', id, method, params });
@@ -74,14 +81,14 @@ test('protected host config and executable hash pin, no source defaults', t => {
   assert.throws(() => loadConfig(file), /mcp_policy_denied/);
 });
 
-test('exact 20 catalog, readOnly annotations, no UI/hidden write, normal read passthrough', async t => {
+test('exact 20 catalog, readOnly annotations, no UI/hidden write, bounded fixture read', async t => {
   const f = fixture(t); await ready(f);
   const list = (await f.send(1, 'tools/list')).result.tools;
   assert.equal(list.length, 20);
   assert.deepEqual(list.map(x => x.name), [...READ, 'issue_write', 'add_issue_comment']);
   assert.equal(list.find(x => x.name === 'issue_write')._meta.ui, undefined);
-  assert.equal((await f.send(2, 'tools/call', call('read_fixture_0', { any: 'read args' }))).result.content[0].text, 'read-through fixture');
-  assert.deepEqual(f.seen(), [{ name: 'read_fixture_0', args: { any: 'read args' } }]);
+  assert.equal((await f.send(2, 'tools/call', call('read_fixture_0', {}))).result.content[0].text, 'read-through fixture');
+  assert.deepEqual(f.seen(), [{ name: 'read_fixture_0', args: {} }]);
   assert.equal((await f.send(3, 'tools/call', call('merge_pull_request', {}))).error.message, ERROR);
   assert.equal((await f.send(4, 'tools/call', call('delete_file', {}))).error.message, ERROR);
   assert.equal(f.seen().length, 1);
@@ -785,3 +792,459 @@ test('installed UI-capable client gets 20 tools and one direct fake update effec
     ['issue_read', 'issue_write']);
   assert.deepEqual(caps, capsBefore);
 });
+
+test('version-two protected policy template admits only pinned groups', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'syn-policy-v2-')); t.after(() => rmSync(dir,{recursive:true,force:true}));
+  const bin=join(dir,'stock');copyFileSync(source,bin);chmodSync(bin,0o700);
+  const file=join(dir,'policy.json');const data={version:2,binary:bin,
+    binary_sha256:createHash('sha256').update(readFileSync(bin)).digest('hex'),
+    repository:'Fixture/Repo',tool_groups:['issues','pull_requests','actions','repository','releases']};
+  writeFileSync(file,JSON.stringify(data),{mode:0o600});
+  assert.equal(loadConfig(file).tools.length,30);
+  for(const groups of [['issues','issues'],['repository'],['issues','unknown'],[],null]) {
+    writeFileSync(file,JSON.stringify({...data,tool_groups:groups}));
+    assert.throws(()=>loadConfig(file),/mcp_policy_denied/);
+  }
+  writeFileSync(file,JSON.stringify({...data,extra:'toolset-all'}));
+  assert.throws(()=>loadConfig(file),/mcp_policy_denied/);
+});
+
+test('version-two tool catalog exposes exact 30 Syn-targeted stock names',async t=>{
+  const f=fixture(t,'capability-v2',400,v2config);await ready(f);
+  const tools=(await f.send(1,'tools/list')).result.tools;
+  assert.deepEqual(tools.map(x=>x.name),v2tools);
+  assert.equal(tools.filter(x=>x.annotations.readOnlyHint).length,23);
+  assert.equal(tools.filter(x=>!x.annotations.readOnlyHint).length,7);
+  assert.ok(!tools.some(x=>['push_files','create_or_update_file','delete_file','create_repository',
+    'create_repository_ruleset','create_gist'].includes(x.name)));
+  assert.equal((await f.send(2,'tools/call',call('push_files',{}))).error.message,ERROR);
+  assert.deepEqual(f.seen(),[]);
+});
+
+const typedWrites=[
+  ['issue_write',{method:'create',owner:'Fixture',repo:'Repo',title:'Scoped issue',body:attributed},[]],
+  ['issue_write',{method:'update',owner:'Fixture',repo:'Repo',issue_number:6,body:attributed},['issue_read']],
+  ['issue_write',{method:'update',owner:'Fixture',repo:'Repo',issue_number:6,state:'closed',labels:['ready']},['issue_read']],
+  ['add_issue_comment',{owner:'Fixture',repo:'Repo',issue_number:6,body:attributed},['issue_read']],
+  ['label_write',{method:'create',owner:'Fixture',repo:'Repo',name:'ready',color:'abcdef'},[]],
+  ['label_write',{method:'update',owner:'Fixture',repo:'Repo',name:'ready',description:'Reviewed'},['get_label']],
+  ['label_write',{method:'delete',owner:'Fixture',repo:'Repo',name:'ready'},['get_label']],
+  ['update_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,draft:false,body:attributed},['pull_request_read']],
+  ['pull_request_review_write',{owner:'Fixture',repo:'Repo',pullNumber:6,method:'create',event:'COMMENT',body:attributed,commitID:'a'.repeat(40)},['pull_request_read']],
+  ['merge_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,expectedHeadSha:'a'.repeat(40),
+    merge_method:'merge',commit_title:'Merge scoped PR',commit_message:attributed},['pull_request_read']],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'run_workflow',workflow_id:'build.yml',ref:'main'},['actions_get']],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'run_workflow',workflow_id:'3000000000',ref:'main'},['actions_get']],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'rerun_failed_jobs',run_id:12345678901},['actions_get']],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'cancel_workflow_run',run_id:12345678901},['actions_get']],
+];
+for(const [name,args,preflight] of typedWrites){
+  test('v2 fake '+name+' '+(args.method??'update')+' dispatches one effect after canonical preflight',async t=>{
+    const f=fixture(t,'capability-v2',400,v2config);await ready(f);
+    assert.equal((await f.send(1,'tools/call',call(name,args))).result.content[0].text,'synthetic effect');
+    assert.deepEqual(f.seen().map(x=>x.name),[...preflight,name]);
+    assert.deepEqual(f.effects(),[name]);
+    assert.deepEqual((await f.send(2,'ping')).result,{});
+    cancel(f,1); // completed writes are never safe late-cancellation targets
+    assert.equal(f.adapter.failed,true);
+    assert.deepEqual(f.effects(),[name]);
+  });
+}
+
+const rejectedReads=[
+  ['issue_read',{method:'get',owner:'Other',repo:'Repo',issue_number:6}],
+  ['list_branches',{owner:'Fixture',repo:'Other'}],
+  ['get_file_contents',{owner:'Fixture',repo:'Repo',path:'../secrets'}],
+  ['get_file_contents',{owner:'Fixture',repo:'Repo',path:'ok',ref:'refs/heads/other'}],
+  ['pull_request_read',{method:'get',owner:'Fixture',repo:'Repo',pullNumber:6,extra:'bad'}],
+  ['actions_get',{method:'delete',owner:'Fixture',repo:'Repo',resource_id:'1'}],
+  ['search_code',{query:'repo:Fixture/Repo good OR repo:Other/Repo'}],
+  ['search_code',{query:'repo:Fixture/Repo good%20OR'}],
+  ['search_issues',{query:'repo:Other/Repo good'}],
+  ['search_pull_requests',{query:'repo:Fixture/Repo repo:Other/Repo'}],
+  ['search_issues',{query:'repo:Fixture/Repo good',owner:'Other',repo:'Repo'}],
+];
+for(const [name,args] of rejectedReads){
+  test('v2 read boundary denies '+name+' cross-scope/injected shape',async t=>{
+    const f=fixture(t,'capability-v2',400,v2config);await ready(f);
+    assert.equal((await f.send(1,'tools/call',call(name,args))).error.message,ERROR);
+    assert.deepEqual(f.seen(),[]);assert.deepEqual(f.effects(),[]);
+  });
+}
+
+test('legacy read boundary rejects foreign repo before child dispatch',async t=>{
+  const f=fixture(t);await ready(f);
+  assert.equal((await f.send(1,'tools/call',call('issue_read',
+    {method:'get',owner:'Other',repo:'Repo',issue_number:6}))).error.message,ERROR);
+  assert.deepEqual(f.seen(),[]);
+});
+
+test('v2 scoped search permits only simple exact-repo terms',async t=>{
+  const f=fixture(t,'capability-v2',400,v2config);await ready(f);
+  assert.equal((await f.send(1,'tools/call',call('search_code',
+    {query:'repo:Fixture/Repo smoke_test',page:1}))).result.content[0].text,'read-through fixture');
+  assert.deepEqual(f.seen().map(x=>x.name),['search_code']);
+});
+
+const deniedWrites=[
+  ['label_write',{method:'update',owner:'Other',repo:'Repo',name:'ready'}],
+  ['label_write',{method:'delete',owner:'Fixture',repo:'Repo',name:'ready',description:'unsafe'}],
+  ['label_write',{method:'rename',owner:'Fixture',repo:'Repo',name:'ready'}],
+  ['issue_write',{method:'update',owner:'Fixture',repo:'Repo',issue_number:6,body:'missing author footer'}],
+  ['issue_write',{method:'create',owner:'Fixture',repo:'Repo',body:attributed}],
+  ['issue_write',{method:'update',owner:'Fixture',repo:'Repo',issue_number:6,state:'nonsense'}],
+  ['issue_write',{method:'update',owner:'Fixture',repo:'Repo',issue_number:6,labels:['bad\nlabel']}],
+  ['issue_write',{method:'update',owner:'Fixture',repo:'Repo',issue_number:6,assignees:['other/user']}],
+  ['issue_write',{method:'create',owner:'Fixture',repo:'Repo',title:'x'.repeat(201),body:attributed}],
+  ['add_issue_comment',{owner:'Fixture',repo:'Repo',issue_number:6,body:'missing author footer'}],
+  ['update_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,base:'foreign-main'}],
+  ['update_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,body:'no footer'}],
+  ['pull_request_review_write',{owner:'Fixture',repo:'Repo',pullNumber:6,method:'delete_pending',event:'APPROVE',body:attributed}],
+  ['pull_request_review_write',{owner:'Fixture',repo:'Repo',pullNumber:6,method:'create',event:'APPROVE',body:attributed,commitID:'b'.repeat(40)}],
+  ['merge_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,merge_method:'merge',expectedHeadSha:'b'.repeat(40)}],
+  ['merge_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,merge_method:'merge'}],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'delete_workflow_run_logs',run_id:123}],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'run_workflow',workflow_id:'https://evil/a.yml',ref:'main'}],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'run_workflow',workflow_id:'build.yml',ref:'other/branch'}],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'rerun_workflow_run',run_id:123,inputs:{other:'nested'}}],
+  ['create_repository',{owner:'Fixture',repo:'Repo',name:'escape'}],
+  ['push_files',{owner:'Fixture',repo:'Repo',branch:'main',files:[]}],
+];
+for(const [name,args] of deniedWrites){
+  test('v2 denies unsupported, foreign, unauthored or unpinned '+name+' write',async t=>{
+    const f=fixture(t,'capability-v2',400,v2config);await ready(f);
+    assert.equal((await f.send(1,'tools/call',call(name,args))).error.message,ERROR);
+    assert.deepEqual(f.effects(),[]);
+    assert.ok(f.seen().every(x=>['issue_read','pull_request_read','actions_get'].includes(x.name)));
+  });
+}
+for(const [name,args] of [
+  ['update_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,state:'closed'}],
+  ['merge_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,expectedHeadSha:'a'.repeat(40),merge_method:'merge'}],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'rerun_workflow_run',run_id:12345678901}],
+]){
+  test('v2 rejects '+name+' on foreign canonical preflight response',async t=>{
+    const f=fixture(t,'capability-v2-wrong-repo',400,v2config);await ready(f);
+    assert.equal((await f.send(1,'tools/call',call(name,args))).error.message,ERROR);
+    assert.deepEqual(f.effects(),[]);
+  });
+}
+for(const [name,args] of [
+  ['label_write',{owner:'Fixture',repo:'Repo',method:'create',name:'ready',color:'abcdef'}],
+  ['update_pull_request',{owner:'Fixture',repo:'Repo',pullNumber:6,draft:false}],
+  ['actions_run_trigger',{owner:'Fixture',repo:'Repo',method:'cancel_workflow_run',run_id:12345678901}],
+]){
+  test('v2 lost '+name+' write result never retries or becomes safely cancellable',async t=>{
+    const f=fixture(t,'capability-v2-uncertain',100,v2config);await ready(f);
+    assert.equal((await f.send(1,'tools/call',call(name,args))).error.message,ERROR);
+    assert.equal(f.adapter.failed,true);
+    assert.deepEqual(f.effects(),[name]);
+    cancel(f,1);
+    assert.equal((await f.send(2,'tools/call',call(name,args))).error.message,ERROR);
+    assert.deepEqual(f.effects(),[name]);
+  });
+}
+
+test('v2 rejects write cancellation while canonical PR preflight is unresolved',async t=>{
+  const f=fixture(t,'timeout',100,v2config);await ready(f);
+  f.adapter.accept({jsonrpc:'2.0',id:1,method:'tools/call',params:call('merge_pull_request',
+    {owner:'Fixture',repo:'Repo',pullNumber:6,merge_method:'merge',expectedHeadSha:'a'.repeat(40)})});
+  await wait(()=>f.seen().some(x=>x.name==='pull_request_read'));
+  cancel(f,1);
+  assert.equal(f.adapter.failed,true);
+  assert.deepEqual(f.seen().map(x=>x.name),['pull_request_read']);
+});
+
+test('v2 search and paths reject encoded scope escapes and URL-shaped refs',()=>{
+  const config={owner:'Fixture',repo:'Repo'};
+  for(const q of ['repo:Fixture/Repo good OR other','repo:Fixture/Repo good%3Arepo',
+    'repo:Fixture/Repo good repo:Other/Repo','repo:Fixture/Repo good+or','repo:Fixture/Repo good%2F'])
+    assert.throws(()=>safeRead('search_code',{query:q},config),/mcp_policy_denied/);
+  for(const path of ['../x','/etc/passwd','a//b','a/%2e%2e','https://evil/a'])
+    assert.throws(()=>safeRead('get_file_contents',{owner:'Fixture',repo:'Repo',path},config),/mcp_policy_denied/);
+  assert.equal(goodAttribution(attributed),true);
+  assert.equal(goodAttribution(attributed+'\nSpoofed'),false);
+});
+
+test('v2 refuses cancellation of a completed Syn workflow run',async t=>{
+  const f=fixture(t,'capability-v2-completed-run',400,v2config);await ready(f);
+  assert.equal((await f.send(1,'tools/call',call('actions_run_trigger',
+    {owner:'Fixture',repo:'Repo',method:'cancel_workflow_run',run_id:12345678901}))).error.message,ERROR);
+  assert.deepEqual(f.seen().map(x=>x.name),['actions_get']);
+  assert.deepEqual(f.effects(),[]);
+});
+
+test('v2 PR conversation comment is allowed but issue_write cannot edit that PR',async t=>{
+  const f=fixture(t,'pr',400,v2config);await ready(f);
+  assert.equal((await f.send(1,'tools/call',call('add_issue_comment',
+    {owner:'Fixture',repo:'Repo',issue_number:6,body:attributed}))).result.content[0].text,
+    'offline comment fixture');
+  assert.equal((await f.send(2,'tools/call',call('issue_write',
+    {method:'update',owner:'Fixture',repo:'Repo',issue_number:6,state:'closed'}))).error.message,ERROR);
+  assert.deepEqual(f.seen().map(x=>x.name),['issue_read','add_issue_comment','issue_read']);
+});
+
+// These fixtures mirror pinned stock v2.0.2 read roots, not over-rich REST payloads.
+const stockRoot = value => ({result:{content:[{type:'text',text:JSON.stringify(value)}]}});
+const syn = {owner:'Fixture',repo:'Repo'};
+const footer = attributed;
+const prRoot = (headRepo='Fixture/Repo') => ({number:6,
+  html_url:'https://github.com/Fixture/Repo/pull/6',state:'open',merged_at:null,
+  head:{sha:'a'.repeat(40),ref:'dev-syn/fixture',repo:{full_name:headRepo}},
+  base:{ref:'main',repo:{full_name:'Fixture/Repo'}}});
+const workflowRoot = (id=3000000000) => ({id,
+  url:'https://api.github.com/repos/fixture/repo/actions/workflows/'+id,
+  path:'.github/workflows/build.yml'}); // stock omits repository
+const runRoot = (id=12345678901) => ({id,status:'in_progress',
+  html_url:'https://github.com/fixture/repo/actions/runs/'+id}); // stock omits repository/url
+function onlyPreflight(name,raw){const calls=[];return {
+  calls,call:async(method,p)=>{assert.equal(method,'tools/call');assert.equal(p.name,name);
+    calls.push(p);return stockRoot(raw);},
+};}
+
+test('version-two preserves all three original Syn security readers and bounded filters',async t=>{
+  const f=fixture(t,'capability-v2',400,v2config);await ready(f);
+  for(const [name,args] of [
+    ['get_code_scanning_alert',{...syn,alertNumber:300}],
+    ['list_code_scanning_alerts',{...syn,state:'open',severity:'high',page:1}],
+    ['get_code_quality_finding',{...syn,findingNumber:301}],
+  ]){
+    assert.ok(v2tools.includes(name));
+    assert.equal((await f.send(f.seen().length+1,'tools/call',call(name,args))).result.content[0].text,'read-through fixture');
+  }
+  assert.deepEqual(f.seen().map(x=>x.name),['get_code_scanning_alert','list_code_scanning_alerts','get_code_quality_finding']);
+  assert.deepEqual(f.effects(),[]);
+  assert.throws(()=>safeRead('list_code_scanning_alerts',{...syn,state:'invalid'},syn),/mcp_policy_denied/);
+});
+
+test('Actions read IDs accept positive safe integers and canonical decimal strings only',()=>{
+  for(const id of [3000000000,12345678901,Number.MAX_SAFE_INTEGER]){
+    assert.equal(safeRead('get_job_logs',{...syn,job_id:id},syn).job_id,id);
+    assert.equal(safeRead('actions_get',{...syn,method:'get_workflow_run',resource_id:String(id)},syn).resource_id,String(id));
+    assert.equal(safeRead('actions_list',{...syn,method:'list_workflow_jobs',resource_id:String(id)},syn).resource_id,String(id));
+  }
+  for(const id of [0,-1,1.2,Number.MAX_SAFE_INTEGER+1,'3000000000','1e10',null])
+    assert.throws(()=>safeRead('get_job_logs',{...syn,job_id:id},syn),/mcp_policy_denied/);
+  for(const id of ['0','01','-1','1e10','NaN','9007199254740992','123.0','',3000000000])
+    assert.throws(()=>safeRead('actions_get',{...syn,method:'get_workflow_run',resource_id:id},syn),/mcp_policy_denied/);
+  assert.equal(safeRead('actions_get',{...syn,method:'get_workflow',resource_id:'build.yml'},syn).resource_id,'build.yml');
+  assert.throws(()=>safeRead('actions_get',{...syn,method:'get_workflow',resource_id:'../build.yml'},syn),/mcp_policy_denied/);
+  assert.throws(()=>safeRead('actions_get',{owner:'Other',repo:'Repo',method:'get_workflow_run',resource_id:'12345678901'},syn),/mcp_policy_denied/);
+});
+
+for(const method of ['update','delete']){
+  test('stock label root without url admits '+method+' only after scoped name and ID proof',async()=>{
+    const pre=onlyPreflight('get_label',{id:'LA_kwFixture123',name:'ready',color:'abcdef',description:'real stock shape'});
+    const input={...syn,method,name:'ready',...(method==='update'?{description:'New'}:{})};
+    assert.deepEqual(await admitWrite('label_write',input,syn,pre.call),input);
+    assert.deepEqual(pre.calls.map(x=>x.arguments),[{...syn,name:'ready'}]);
+    for(const label of [{id:'LA_kwFixture123',name:'wrong'},
+       {id:'../bad',name:'ready'},{id:'',name:'ready'},{name:'ready'}]){
+      const wrong=onlyPreflight('get_label',label);
+      await assert.rejects(admitWrite('label_write',input,syn,wrong.call),/mcp_policy_denied/);
+      assert.equal(wrong.calls.length,1);
+    }
+    const foreign=onlyPreflight('get_label',{id:'LA_kwFixture123',name:'ready'});
+    await assert.rejects(admitWrite('label_write',{...input,owner:'Other'},syn,foreign.call),/mcp_policy_denied/);
+    assert.equal(foreign.calls.length,0);
+  });
+}
+
+for(const id of ['3000000000','build.yml']){
+  test('stock workflow GET case-folds only canonical owner/repo and forwards string '+id,async()=>{
+    const pre=onlyPreflight('actions_get',workflowRoot());
+    const input={...syn,method:'run_workflow',workflow_id:id,ref:'main'};
+    assert.deepEqual(await admitWrite('actions_run_trigger',input,syn,pre.call),input);
+    assert.equal(pre.calls.length,1);
+    assert.equal(pre.calls[0].arguments.resource_id,id);
+    for(const url of ['https://api.github.com/repos/Other/repo/actions/workflows/3000000000',
+      'https://evil.example/repos/fixture/repo/actions/workflows/3000000000',
+      'https://api.github.com/repos/fixture/repo/actions/workflows/3000000000?x=1',
+      'https://api.github.com/repos/fixture/repo/actions/runs/3000000000']){
+      const bad=onlyPreflight('actions_get',{...workflowRoot(),url});
+      await assert.rejects(admitWrite('actions_run_trigger',input,syn,bad.call),/mcp_policy_denied/);
+    }
+    const numeric=onlyPreflight('actions_get',workflowRoot());
+    await assert.rejects(admitWrite('actions_run_trigger',{...input,workflow_id:3000000000},syn,numeric.call),/mcp_policy_denied/);
+    assert.equal(numeric.calls.length,0);
+  });
+}
+
+for(const method of ['rerun_workflow_run','rerun_failed_jobs','cancel_workflow_run']){
+  test('eleven-digit stock run canonical GET admits '+method+' without ID truncation',async()=>{
+    const pre=onlyPreflight('actions_get',runRoot());
+    const input={...syn,method,run_id:12345678901};
+    assert.deepEqual(await admitWrite('actions_run_trigger',input,syn,pre.call),input);
+    assert.deepEqual(pre.calls.map(x=>x.arguments.resource_id),['12345678901']);
+    const foreign=onlyPreflight('actions_get',{...runRoot(),html_url:
+      'https://github.com/Other/Repo/actions/runs/12345678901'});
+    await assert.rejects(admitWrite('actions_run_trigger',input,syn,foreign.call),/mcp_policy_denied/);
+    for(const html_url of ['https://evil.example/fixture/repo/actions/runs/12345678901',
+      'https://github.com/fixture/repo/actions/runs/12345678901?x=1',
+      'https://github.com/fixture/repo/actions/runs/12345678902'])
+      await assert.rejects(admitWrite('actions_run_trigger',input,syn,
+        onlyPreflight('actions_get',{...runRoot(),html_url}).call),/mcp_policy_denied/);
+    const bad=onlyPreflight('actions_get',runRoot());
+    await assert.rejects(admitWrite('actions_run_trigger',{...input,run_id:Number.MAX_SAFE_INTEGER+1},syn,bad.call),/mcp_policy_denied/);
+    assert.equal(bad.calls.length,0);
+  });
+}
+
+for(const [name,input] of [
+  ['update_pull_request',{...syn,pullNumber:6,draft:false}],
+  ['pull_request_review_write',{...syn,pullNumber:6,method:'create',event:'APPROVE',body:footer,commitID:'a'.repeat(40)}],
+  ['pull_request_review_write',{...syn,pullNumber:6,method:'create',event:'REQUEST_CHANGES',body:footer,commitID:'a'.repeat(40)}],
+  ['merge_pull_request',{...syn,pullNumber:6,merge_method:'merge',expectedHeadSha:'a'.repeat(40),commit_title:'Merge',commit_message:footer}],
+]){
+  test('canonical Syn PR with fork head supports pinned '+name,async()=>{
+    const pre=onlyPreflight('pull_request_read',prRoot('Contributor/Fork'));
+    assert.deepEqual(await admitWrite(name,input,syn,pre.call),input);
+    assert.equal(pre.calls.length,1);
+    assert.deepEqual(pre.calls[0].arguments,{...syn,method:'get',pullNumber:6});
+    for(const altered of [
+      {...prRoot('Contributor/Fork'),base:{ref:'main',repo:{full_name:'Other/Repo'}}},
+      {...prRoot('Contributor/Fork'),html_url:'https://github.com/Other/Repo/pull/6'},
+      prRoot('bad/three/parts'),
+      prRoot('../Repo'),
+      {...prRoot('Contributor/Fork'),head:{...prRoot('Contributor/Fork').head,sha:'b'.repeat(40)}},
+    ]){
+      const checked=onlyPreflight('pull_request_read',altered);
+      if(altered.head.sha!=='a'.repeat(40)&&name==='update_pull_request')continue; // updates do not claim a caller pin
+      await assert.rejects(admitWrite(name,input,syn,checked.call),/mcp_policy_denied/);
+    }
+  });
+}
+
+test('create review requires observed commit for approvals; submit_pending cannot pretend to pin',async()=>{
+  for(const event of ['APPROVE','REQUEST_CHANGES']){
+    const input={...syn,pullNumber:6,method:'create',event,body:footer};
+    const pre=onlyPreflight('pull_request_read',prRoot());
+    await assert.rejects(admitWrite('pull_request_review_write',input,syn,pre.call),/mcp_policy_denied/);
+    const moved=onlyPreflight('pull_request_read',prRoot());
+    await assert.rejects(admitWrite('pull_request_review_write',{...input,commitID:'b'.repeat(40)},syn,moved.call),/mcp_policy_denied/);
+    assert.deepEqual(await admitWrite('pull_request_review_write',{...input,commitID:'a'.repeat(40)},syn,moved.call),{...input,commitID:'a'.repeat(40)});
+    const pending=onlyPreflight('pull_request_read',prRoot());
+    await assert.rejects(admitWrite('pull_request_review_write',{...input,method:'submit_pending',commitID:'a'.repeat(40)},syn,pending.call),/mcp_policy_denied/);
+  }
+  const comment={...syn,pullNumber:6,method:'submit_pending',event:'COMMENT',body:footer};
+  assert.deepEqual(await admitWrite('pull_request_review_write',comment,syn,onlyPreflight('pull_request_read',prRoot()).call),comment);
+});
+
+test('issue reasons match pinned stock and plain reopening has one guarded effect',async t=>{
+  const f=fixture(t,'capability-v2',400,v2config);await ready(f);
+  for(const reason of ['completed','not_planned']){
+    const id=f.out.length+1;
+    assert.equal((await f.send(id,'tools/call',call('issue_write',{...syn,method:'update',issue_number:6,state:'closed',state_reason:reason}))).result.content[0].text,'synthetic effect');
+  }
+  const before=f.seen().length;
+  for(const reason of ['reopened','duplicate','invalid']){
+    const id=f.out.length+1;
+    assert.equal((await f.send(id,'tools/call',call('issue_write',{...syn,method:'update',issue_number:6,state:'closed',state_reason:reason}))).error.message,ERROR);
+  }
+  assert.equal(f.seen().length,before);
+  assert.equal((await f.send(f.out.length+1,'tools/call',call('issue_write',{...syn,method:'update',issue_number:6,state:'open'}))).result.content[0].text,'synthetic effect');
+  assert.deepEqual(f.effects(),['issue_write','issue_write','issue_write']);
+});
+
+const projectedFields={
+  issue_write:['method','owner','repo','issue_number','title','body','state','state_reason',
+    'labels','assignees','milestone','type'],
+  add_issue_comment:['owner','repo','issue_number','body'],
+  label_write:['method','owner','repo','name','new_name','color','description'],
+  update_pull_request:['owner','repo','pullNumber','title','body','draft','state','maintainer_can_modify'],
+  pull_request_review_write:['method','owner','repo','pullNumber','event','body','commitID'],
+  merge_pull_request:['owner','repo','pullNumber','expectedHeadSha','merge_method','commit_title','commit_message'],
+  actions_run_trigger:['method','owner','repo','workflow_id','ref','run_id','inputs'],
+};
+const projectedRequired={
+  issue_write:['method','owner','repo'],
+  add_issue_comment:['owner','repo','issue_number','body'],
+  label_write:['method','owner','repo','name'],
+  update_pull_request:['owner','repo','pullNumber'],
+  pull_request_review_write:['method','owner','repo','pullNumber','event','body'],
+  merge_pull_request:['owner','repo','pullNumber','expectedHeadSha','merge_method','commit_title','commit_message'],
+  actions_run_trigger:['method','owner','repo'],
+};
+const projectedEnums={
+  issue_write:{method:['create','update'],state_reason:['completed','not_planned']},
+  label_write:{method:['create','update','delete']},
+  pull_request_review_write:{method:['create','submit_pending'],event:['APPROVE','REQUEST_CHANGES','COMMENT']},
+  merge_pull_request:{merge_method:['merge','squash']},
+  actions_run_trigger:{method:['run_workflow','rerun_workflow_run','rerun_failed_jobs','cancel_workflow_run']},
+};
+
+test('v2 tools/list advertises only supported write methods, fields and unconditional requirements',async t=>{
+  const f=fixture(t,'capability-v2',500,v2config);await ready(f);
+  const tools=(await f.send(1,'tools/list')).result.tools;
+  assert.equal(tools.length,30);assert.deepEqual(Object.keys(WRITE_CONTRACT),Object.keys(projectedFields));
+  assert.deepEqual(new Set(Object.keys(WRITE_CONTRACT)),WRITE_TOOLS);
+  for(const [name,fields] of Object.entries(projectedFields)){
+    const tool=tools.find(x=>x.name===name),schema=tool.inputSchema;
+    assert.equal(schema.type,'object');assert.equal(schema.additionalProperties,false);
+    assert.deepEqual(Object.keys(schema.properties),fields);
+    assert.deepEqual(schema.required,projectedRequired[name]);
+    assert.ok(tool.description.startsWith(WRITE_CONTRACT[name].description.slice(0,20)));
+    for(const [key,values] of Object.entries(projectedEnums[name]??{}))
+      assert.deepEqual(schema.properties[key].enum,values);
+    assert.ok(!tool._meta?.ui);
+  }
+  assert.ok(!tools.find(x=>x.name==='actions_run_trigger').inputSchema.properties.method.enum.includes('delete_workflow_run_logs'));
+  assert.ok(!tools.find(x=>x.name==='merge_pull_request').inputSchema.properties.merge_method.enum.includes('rebase'));
+  assert.ok(!tools.find(x=>x.name==='pull_request_review_write').inputSchema.properties.method.enum.includes('resolve_thread'));
+  assert.ok(!Object.hasOwn(tools.find(x=>x.name==='update_pull_request').inputSchema.properties,'reviewers'));
+  assert.ok(!Object.hasOwn(tools.find(x=>x.name==='issue_write').inputSchema.properties,'duplicate_of'));
+  assert.deepEqual(tools.find(x=>x.name==='actions_get').inputSchema.properties.method.enum,
+    ['get_workflow','get_workflow_run','get_workflow_job','get_workflow_run_usage','get_workflow_run_logs_url']);
+  assert.deepEqual(tools.find(x=>x.name==='issue_read').inputSchema.properties.method.enum,
+    ['get','get_comments','get_labels']);
+  assert.deepEqual(f.effects(),[]);
+});
+
+test('projection copies stock schema without modifying vendor metadata or caller input',()=>{
+  const stock={name:'merge_pull_request',description:'Stock rebase merge tool',inputSchema:{type:'object',
+    properties:Object.fromEntries(projectedFields.merge_pull_request.map(k=>[k,{type:'string',
+      ...(k==='merge_method'?{enum:['merge','squash','rebase']}:{}),description:'stock '+k}])),
+    required:['owner','repo','pullNumber']}};
+  const before=structuredClone(stock),projected=projectTool(stock);
+  assert.deepEqual(stock,before);
+  assert.deepEqual(projected.inputSchema.properties.merge_method.enum,['merge','squash']);
+  assert.deepEqual(stock.inputSchema.properties.merge_method.enum,['merge','squash','rebase']);
+  projected.inputSchema.properties.commit_title.description='local test mutation';
+  assert.equal(stock.inputSchema.properties.commit_title.description,'stock commit_title');
+  assert.throws(()=>projectTool({...stock,inputSchema:{...stock.inputSchema,
+    properties:{...stock.inputSchema.properties,commit_message:undefined}}}),/mcp_policy_denied/);
+  assert.throws(()=>projectTool({...stock,inputSchema:{...stock.inputSchema,
+    properties:{...stock.inputSchema.properties,merge_method:{type:'string',enum:['rebase']}}}}),/mcp_policy_denied/);
+});
+
+const advertisedWriteCases=[
+  ['issue_write','create',{...syn,method:'create',title:'Scoped issue',body:footer}],
+  ['issue_write','update',{...syn,method:'update',issue_number:6,state:'open'}],
+  ['add_issue_comment','comment',{...syn,issue_number:6,body:footer}],
+  ['label_write','create',{...syn,method:'create',name:'ready',color:'abcdef'}],
+  ['label_write','update',{...syn,method:'update',name:'ready',description:'Reviewed'}],
+  ['label_write','delete',{...syn,method:'delete',name:'ready'}],
+  ['update_pull_request','update',{...syn,pullNumber:6,draft:false}],
+  ...['APPROVE','REQUEST_CHANGES','COMMENT'].map(event=>['pull_request_review_write','create',
+    {...syn,pullNumber:6,method:'create',event,body:footer,commitID:'a'.repeat(40)}]),
+  ['pull_request_review_write','submit_pending',{...syn,pullNumber:6,method:'submit_pending',event:'COMMENT',body:footer}],
+  ...['merge','squash'].map(merge_method=>['merge_pull_request',merge_method,
+    {...syn,pullNumber:6,expectedHeadSha:'a'.repeat(40),merge_method,
+      commit_title:'Merge',commit_message:footer}]),
+  ['actions_run_trigger','run_workflow',{...syn,method:'run_workflow',workflow_id:'build.yml',ref:'main'}],
+  ...['rerun_workflow_run','rerun_failed_jobs','cancel_workflow_run'].map(method=>
+    ['actions_run_trigger',method,{...syn,method,run_id:12345678901}]),
+];
+for(const [name,advertised,args] of advertisedWriteCases){
+  test('advertised v2 '+name+' '+advertised+' has a canonical one-effect example',async t=>{
+    const f=fixture(t,'capability-v2',500,v2config);await ready(f);
+    const tools=(await f.send(1,'tools/list')).result.tools,tool=tools.find(x=>x.name===name);
+    if(args.method)assert.ok(tool.inputSchema.properties.method.enum.includes(args.method));
+    if(args.event)assert.ok(tool.inputSchema.properties.event.enum.includes(args.event));
+    if(args.merge_method)assert.ok(tool.inputSchema.properties.merge_method.enum.includes(args.merge_method));
+    for(const required of tool.inputSchema.required)assert.ok(Object.hasOwn(args,required),required);
+    const result=await f.send(2,'tools/call',call(name,args));
+    assert.equal(result.result.content[0].text,'synthetic effect');
+    assert.equal(f.seen().at(-1).name,name);assert.deepEqual(f.effects(),[name]);
+  });
+}

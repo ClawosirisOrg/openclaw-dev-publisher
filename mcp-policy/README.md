@@ -132,3 +132,76 @@ attenuate the existing host credential or rotate/mint any App token.
 
 Tests use a fake stdio child and no GitHub traffic or real credentials:
 `node --test test/mcp-issue-policy.test.mjs`, then `npm run test:all`.
+
+## Version 2 Syn engineering capability candidate (source only; not activated)
+
+The existing four-key policy remains version 1 with 20 tools. A separate,
+protected host policy with exactly binary, binary_sha256, repository,
+version: 2 and tool_groups selects from issues, pull_requests, actions,
+repository and releases. Issue preflight is mandatory. This source candidate
+includes 30 pinned stock v2.0.2 names (23 reads, seven writes), not all 91.
+The additional three reads retain the production CodeQL/scanning surface.
+The explicit registry and write preflights are in syn-tool-policy.mjs and
+syn-write-policy.mjs; deployment must copy both beside issue-policy.mjs.
+Review the protected version-two policy, Gateway toolFilter and session
+admission separately. Copying source does not enlarge the active v1 catalog.
+Version-two tools/list projects the stock input schemas through a small
+static Syn contract: only admitted write fields/method values are advertised,
+with unconditional required fields and conditional guards explained in tool
+descriptions. Method-based reads likewise omit unsupported method values.
+The stock child catalog and caller arguments remain unchanged; the adapter
+still checks each request against its separate, fail-closed admission guards.
+Version-one inventory behavior is unchanged. JSON Schema alone does not
+encode canonical target proofs, attribution, status, or moving-head races.
+
+Coverage: issues: canonical reads, issue create/update/comment and label
+resource CRUD; pull_requests: read/diff/files/checks, body/state/draft update,
+review create/submit, and head-SHA-pinned merge/squash with attributed merge
+message (rebase rewrite is withheld). APPROVE/REQUEST_CHANGES review creation
+requires the observed head commitID. Stock submit_pending ignores commitID;
+that method is limited to attributed COMMENT, not an unpinned approval.
+Actions: workflow/run/job/log read, dispatch and rerun/cancel after canonical
+target GET. Repository:
+branches/files/commits/tree reads, the three prior CodeQL/security readers,
+and narrowly parsed exact-repo search;
+releases: list/get only. Existing request_signed_publication remains the only
+route for publishing exact locally SSH-signed Git commits, guarded branch
+create/fast-forward update and issue-first PR creation. Stock push_files,
+create_or_update_file, delete_file, unsigned PR branch updates, repository
+admin, organization/global/user tools and arbitrary API URLs stay denied.
+
+Every exposed read now checks owner/repo or an exact-prefix, simple-token
+repo:owner/repo query before child dispatch, including version 1. Traversal,
+encoded query operators, foreign heads, unknown fields/methods and nested
+object arguments fail closed. Stock readOnlyHint is cross-checked, not trusted
+alone. Existing canonical issue/PR preflights and form denial remain; new
+writes demand canonical label, PR or Actions target proof and bounded fields.
+Stock get_label has name/id/color/description but no URL; the requested
+repository/name is pinned before the read and its returned name/stable ID
+are checked. Canonical Syn PRs may have a well-formed fork head, but must
+retain their Syn base and canonical PR URL. Actions resource IDs are positive
+safe integers represented as canonical decimal strings for stock resource_id;
+workflow_id stays a stock string (decimal ID or filename). GitHub normalizes
+repository case in Actions URLs, so the preflight compares only owner/repo
+case-insensitively while pinning host, path, and ID exactly. Stock workflow
+GET includes an API URL; stock run GET omits API URL/repository, so rerun and
+cancel preflight instead anchors the exact scoped html_url and run ID.
+A supplied PR head SHA is compared with a fresh canonical GET and passed to
+GitHub's expectedHeadSha merge parameter. That GET is not an atomic CAS for
+other operations; GitHub branch protections and checks remain authoritative.
+Write failures are uncertain and never retried. New issue/PR/comment/review
+bodies must end in the four attribution lines: the adapter validates their
+shape, but cannot authenticate effective model/thinking, which the author
+must verify from the runtime. No human text is rewritten. Syn's separate
+product MVP forbidden-write ceiling is unchanged.
+
+Gaps requiring separately reviewed Syn-only typed routes: milestone resource
+creation/update (issue_write can attach an existing ID); PR creation is via
+the signed issue-first publisher, not stock create_pull_request; inline review
+comments, thread resolution and comment replies/edit/delete require canonical
+review/comment ownership and parent-PR proofs; auto-merge needs a typed route.
+Actions log deletion is deliberately excluded. Pinned stock exposes release
+reads but no release write, and no general check/status mutation endpoint.
+Do not claim full coverage until those routes are reviewed. Administration
+permission is absent from the App and would need an explicit owner grant if
+truly required; no product-Syn mutation authority is implied.

@@ -7,6 +7,8 @@ import { spawn } from 'node:child_process';
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { expandGroups, WRITE_TOOLS, safeRead, safeLegacyRead, goodAttribution, goodText, projectTool } from './syn-tool-policy.mjs';
+import { admitWrite } from './syn-write-policy.mjs';
 
 const MAX_LINE = 1024 * 1024;
 const TIMEOUT = 30000;
@@ -56,19 +58,25 @@ function protectedFile(path, max, executable = false) {
 export function loadConfig(path) {
   try {
     const data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(protectedFile(path, 16384)));
-    if (!plain(data) || Object.keys(data).sort().join(',') !==
-        'binary,binary_sha256,read_tools,repository' ||
+    if (!plain(data)) throw fail();
+    const keys = Object.keys(data).sort().join(',');
+    const legacy = keys === 'binary,binary_sha256,read_tools,repository';
+    const v2 = keys === 'binary,binary_sha256,repository,tool_groups,version' && data.version === 2;
+    if ((!legacy && !v2) ||
         typeof data.repository !== 'string' || data.repository.split('/').length !== 2 ||
         !data.repository.split('/').every(s => PART.test(s) && !['.', '..'].includes(s)) ||
-        !Array.isArray(data.read_tools) || data.read_tools.length !== 18 ||
-        new Set(data.read_tools).size !== 18 ||
-        !data.read_tools.every(x => typeof x === 'string' && NAME.test(x) && !['issue_write', 'add_issue_comment'].includes(x)) ||
-        !data.read_tools.includes('issue_read') ||
+        (legacy && (!Array.isArray(data.read_tools) || data.read_tools.length !== 18 ||
+          new Set(data.read_tools).size !== 18 ||
+          !data.read_tools.every(x => typeof x === 'string' && NAME.test(x) &&
+            !['issue_write','add_issue_comment'].includes(x)) || !data.read_tools.includes('issue_read'))) ||
         typeof data.binary_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(data.binary_sha256)) throw fail();
+    const tools = v2 ? expandGroups(data.tool_groups) : [...data.read_tools, 'issue_write','add_issue_comment'];
     const bytes = protectedFile(data.binary, 100 * 1024 * 1024, true);
     if (createHash('sha256').update(bytes).digest('hex') !== data.binary_sha256) throw fail();
     const [owner, repo] = data.repository.split('/');
-    return Object.freeze({ binary: data.binary, owner, repo, readTools: Object.freeze([...data.read_tools]) });
+    return Object.freeze({ binary: data.binary, owner, repo, version: v2 ? 2 : 1,
+      readTools: Object.freeze(v2 ? tools.filter(n => !WRITE_TOOLS.has(n)) : [...data.read_tools]),
+      tools: Object.freeze(tools) });
   } catch { throw fail(); }
 }
 
@@ -249,14 +257,14 @@ export class PolicyAdapter {
     if (own(response, 'error') || !plain(result) || !Array.isArray(result.tools) ||
         own(result, 'nextCursor') || new Set(result.tools.map(t => t?.name)).size !== result.tools.length) throw fail();
     const byName = new Map(result.tools.map(t => [t.name, t]));
-    const names = [...this.config.readTools, 'issue_write', 'add_issue_comment'];
+    const names = this.config.tools ?? [...this.config.readTools, 'issue_write', 'add_issue_comment'];
     if (names.some(n => !plain(byName.get(n)) ||
-        (['issue_write', 'add_issue_comment'].includes(n)
+        ((this.config.version === 2 ? WRITE_TOOLS.has(n) : ['issue_write','add_issue_comment'].includes(n))
           ? byName.get(n).annotations?.readOnlyHint !== false
           : byName.get(n).annotations?.readOnlyHint !== true))) throw fail();
     this.list = { ...result, tools: names.map(n => {
-      const tool = { ...byName.get(n) };
-      if (n === 'issue_write') {
+      const tool = this.config.version === 2 ? projectTool(byName.get(n)) : { ...byName.get(n) };
+      if (this.config.version === 2 ? WRITE_TOOLS.has(n) : n === 'issue_write') {
         // The MCP App form is an out-of-band write path without our preflight.
         for (const field of ['_meta', 'meta']) {
           if (plain(tool[field])) { tool[field] = { ...tool[field] }; delete tool[field].ui; }
@@ -307,12 +315,24 @@ export class PolicyAdapter {
             typeof frame.params.name !== 'string' || !plain(frame.params.arguments)) throw fail();
         await this.inventory();
         const name = frame.params.name;
-        if (!['issue_write', 'add_issue_comment'].includes(name) &&
-            !this.config.readTools.includes(name)) throw fail();
+        if (!(this.config.tools ?? [...this.config.readTools,'issue_write','add_issue_comment']).includes(name)) throw fail();
         if (name === 'issue_write' || name === 'add_issue_comment') {
           const args = name === 'issue_write'
             ? issueWriteArgs(frame.params.arguments, this.config)
             : commentArgs(frame.params.arguments, this.config);
+          if (this.config.version === 2) {
+            if (name === 'add_issue_comment') {
+              if (!goodAttribution(args.body)) throw fail();
+            } else if ((own(args,'body') && !goodAttribution(args.body)) ||
+                (own(args,'title') && !goodText(args.title,200)) ||
+                (args.method === 'create' && (!own(args,'title') || !own(args,'body'))) ||
+                (args.method === 'update' && Object.keys(args).length <= 4) ||
+                (own(args,'state') && !['open','closed'].includes(args.state)) ||
+                (own(args,'state_reason') &&
+                  (args.state!=='closed'||!['completed','not_planned'].includes(args.state_reason))) ||
+                ['labels','assignees'].some(k => own(args,k) && args[k].some(s =>
+                  !goodText(s,200) || k === 'assignees' && !/^[A-Za-z0-9-]{1,39}$/.test(s)))) throw fail();
+          }
           if (name === 'add_issue_comment' || args.method === 'update') {
             const preflight = await this.call('tools/call', { name: 'issue_read', arguments: {
               method: 'get', owner: this.config.owner, repo: this.config.repo, issue_number: args.issue_number,
@@ -326,8 +346,20 @@ export class PolicyAdapter {
             this.abort(); throw fail();
           }
           await this.send({ jsonrpc: '2.0', id, result: response.result });
+        } else if (this.config.version === 2 && WRITE_TOOLS.has(name)) {
+          const args = await admitWrite(name, frame.params.arguments, this.config, this.call.bind(this));
+          const response = await this.call('tools/call', { name, arguments: args });
+          if (own(response, 'error') || !plain(response.result) ||
+              own(response.result,'isError') && response.result.isError !== false ||
+              response.result.structuredContent?.status === 'awaiting_user_submission') {
+            this.abort(); throw fail();
+          }
+          await this.send({ jsonrpc:'2.0', id, result:response.result });
         } else {
-          const response = await this.call('tools/call', frame.params);
+          const args = this.config.version === 2
+            ? safeRead(name, frame.params.arguments, this.config)
+            : safeLegacyRead(name, frame.params.arguments, this.config);
+          const response = await this.call('tools/call', { name, arguments: args });
           if (own(response, 'error')) throw fail();
           await this.sendSafe(id, response.result);
         }
@@ -375,7 +407,7 @@ export class PolicyAdapter {
 }
 
 export function start(config, stdin = process.stdin, stdout = process.stdout, launcher = spawn, timeout = TIMEOUT) {
-  const tools = [...config.readTools, 'issue_write', 'add_issue_comment'].join(',');
+  const tools = (config.tools ?? [...config.readTools, 'issue_write', 'add_issue_comment']).join(',');
   const child = launcher(config.binary, ['stdio', '--tools', tools], {
     stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env }, windowsHide: true,
   });
